@@ -108,17 +108,44 @@ python3 -m mem2w.ms_swift_adapter command --config configs/ms_swift_sft.json
 
 默认关键参数对应计划文档：`model=Qwen/Qwen3.5-9B`、`template=qwen3_5`、`tuner_type=full`、`torch_dtype=bfloat16`、`max_length=4096`、`packing=false`、`gradient_checkpointing=false`、`enable_thinking=false`、`remove_unused_columns=false`。ms-swift 的 SFT pipeline 会在训练前把 `model.config.use_cache` 设为 `false`；它不是 SftArguments 的 JSON 字段。项目 runner 在 tuner 准备后重新 attach/freeze memory，optimizer 只接收 Mem2W memory 参数。
 
-## 3. 与双目标训练的边界
+## 3. 双目标训练（native ms-swift fork）
 
 ms-swift 的标准 SFT Trainer 能正确完成 chat template、assistant `loss` mask 和 causal-LM shift。它的 `loss_scale` 还支持 token 权重，`enable_channel_loss=true` 可以按 `channel` 统计 action/recall 的诊断指标。
 
-本版 Mem2W 目标仍要求：
+Mem2W 目标要求：
 
 1. `L_act` 与 `L_recall` 分别按自己的有效 token 数归一化，再乘 `lambda_recall`；
 2. warmup 阶段两个分支都更新 `W_Q/K/V/W_O`；约束阶段 recall 分支只更新 `W_Q/K`；
 3. 两分支在一个逻辑 optimizer step 内完成，且主干梯度始终可穿过冻结 block 传到 memory。
 
-当前两条 mode 管线刻意只做单分支 masked CE。ms-swift 原生 `swift sft` 不会根据 `sample_type` 自动做双分支归一化或 recall-only 梯度路由；`--mode both` 只是混合数据 smoke test，不能宣称已实现双目标 Mem2W 训练。后续双目标训练需要在 memory wrapper 外接 custom trainer（或覆写 SwiftSft/Seq2SeqTrainer 的 `compute_loss`）。
+当前普通 `swift sft --tuner_type mem2w` 仍是单流 SFT，用于兼容性 smoke test；它不会根据
+`sample_type` 自动做双分支归一化或 recall-only 梯度路由。双目标训练已经迁移到
+native ms-swift fork 的 `swift mem2w-sft` 入口：它复用 ms-swift 的模型加载、
+`qwen3_5` template encoder 和 data collator，但由 native Mem2W trainer 在一个逻辑
+optimizer step 内依次完成 action/recall 两次 forward/backward，再执行一次 step。
+
+```bash
+python swift/cli/main.py mem2w-sft \
+  --model /mnt/public/model/Qwen3.5-4B \
+  --action-dataset data/ms_swift/action_train.jsonl \
+  --recall-dataset data/ms_swift/recall_train.jsonl \
+  --template qwen3_5 \
+  --output-dir artifacts/mem2w_dual \
+  --max-steps 1000 \
+  --warmup-fraction 0.20 \
+  --lambda-recall 1.0 \
+  --mem2w-insertion-index 15 \
+  --mem2w-slots 512 \
+  --mem2w-key-dim 256 \
+  --mem2w-value-dim 256
+```
+
+`swift mem2w-sft` 的 W 阶段让两个分支更新 `W_Q/K/V/W_O`；C 阶段仅对 recall
+分支 detach `V/W_O`，保留 `W_Q/K` 的梯度。每个分支先按自身有效 label token
+数归一化，再乘 `lambda_recall`；每个逻辑 step 只执行一次 optimizer step。每一步
+输出 `checkpoint-N/memory.safetensors`、`mem2w_config.json`、`optimizer.pt` 和
+`mem2w_dual_state.json`，可以用 `--resume-from-checkpoint` 恢复。普通 `swift sft`
+和此入口共享同一个 native `mem2w` tuner 与四参数 checkpoint 格式。
 
 ## 4. token mask 验证
 
