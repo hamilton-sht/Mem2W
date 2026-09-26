@@ -121,7 +121,10 @@ def _validate_tool_message(message: Mapping[str, Any], index: int, errors: list[
     role = _role(message)
     if role == "tool_call":
         obj = _parse_object(message.get("content"))
-        if obj is None or not str(obj.get("name", "")).strip() or not isinstance(obj.get("arguments"), Mapping):
+        arguments = obj.get("arguments") if obj is not None else None
+        if isinstance(arguments, str):
+            arguments = _parse_object(arguments)
+        if obj is None or not str(obj.get("name", "")).strip() or not isinstance(arguments, Mapping):
             errors.append(f"messages[{index}] tool_call content must be an object with name and object arguments")
         if "tool_call_id" in message and not str(message.get("tool_call_id") or "").strip():
             errors.append(f"messages[{index}] tool_call_id is empty")
@@ -237,6 +240,21 @@ def _disable_message_losses(row: Mapping[str, Any], *, only_role: Optional[str] 
     return result
 
 
+def _expected_tool_call_count(row: Mapping[str, Any]) -> int:
+    count = 0
+    for message in row.get("messages", []):
+        if not isinstance(message, Mapping):
+            continue
+        role = _role(message)
+        if role == "tool_call":
+            count += 1
+        elif role == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                count += len(calls)
+    return count
+
+
 def _encode(template: Any, row: Mapping[str, Any]) -> Mapping[str, Any]:
     encoded = template.encode(dict(row), return_template_inputs=True)
     if isinstance(encoded, (list, tuple)):
@@ -300,12 +318,17 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     for message in transformed_messages:
         if isinstance(message, Mapping) and _role(message) == "assistant" and "<tool_call>" in _message_text(message):
             tool_call_rendered.append(_message_text(message))
+    expected_tool_calls = _expected_tool_call_count(row)
+    if len(tool_call_rendered) != expected_tool_calls:
+        raise TemplateAuditError(
+            f"qwen3_5 rendered {len(tool_call_rendered)} tool_call blocks, expected {expected_tool_calls}")
     return {
         "tokens": len(input_ids),
         "target_tokens": target_count,
         "template_suffix_targets": len(baseline_targets),
         "transformed_messages": len(transformed_messages),
         "tool_call_blocks": len(tool_call_rendered),
+        "expected_tool_call_blocks": expected_tool_calls,
     }
 
 
