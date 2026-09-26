@@ -1,10 +1,10 @@
 # Mem2W 新仓库、模型改造与 ms-swift SFT 实施计划
 
-日期：2026-09-26 · 版本：v0.1 · 状态：实施设计，尚未完成模型加载或训练验收。
+日期：2026-09-26 · 版本：v0.1 · 状态：最小两模式实现已完成；真实 9B 长跑与 W/C 调度仍待资源预检后验收。
 
 ## 1. 本次交付与实施范围
 
-本次交付计划文档，描述如何建立独立的 `Mem2W` 仓库，实现 Qwen3.5-9B 模型层改造及基于 ms-swift 的双目标 SFT。附件 [Mem2W 算法与需求 v0.1](/Users/haoting/Downloads/Mem2W_Qwen3.5_9B_Algorithm_and_Requirements_v0.1.md) 作为算法设计与验收依据；其中的训练、部署、实验条目在这里转化为未来工作项，不代表已经执行。
+本次文档描述独立的 `Mem2W` 仓库、Qwen3.5-9B 模型层改造及基于 ms-swift 的双目标 SFT 计划。附件 [Mem2W 算法与需求 v0.1](/Users/haoting/Downloads/Mem2W_Qwen3.5_9B_Algorithm_and_Requirements_v0.1.md) 作为算法设计与验收依据。当前已经落地的是可插拔 memory 层、冻结主干、action/recall 两条独立 masked-CE SFT 通路和 `memory.safetensors` 导出；双分支 W/C 调度、正式 9B 训练和完整验收仍是后续工作。
 
 实现范围：持久 KV 记忆模块、受控模型接入、主干冻结、action/recall 数据接入、模板与 mask 验证、双分支 Trainer、检查点与恢复、最小推理验证。沿用已有 MemRL 系统导出的固定快照和日志，不在本阶段重写教师检索器或教师采集平台。
 
@@ -12,32 +12,26 @@
 
 ## 2. 仓库与运行位置
 
-本地工作目录为 `/Users/haoting/Documents/ChatGPT/Mem2W`，检查时已有空 Git 仓库，无 commit、无 remote。后续代码落在该仓库，开发分支建议 `codex/mem2w-v0.1`。
+本地工作目录为 `/Users/haoting/Documents/ChatGPT/Mem2W`，代码和最小测试已落在该 Git 仓库。当前未配置远程仓库；如需推送，后续再由用户指定 GitHub 组织、可见性和 remote。
 
 结合前文的 Muxi 环境，远端候选工作目录为 `memrl-40949:/mnt/public/haoting/Mem2W`。这是拟采用的独立目录，尚未创建或验证存储条件；既有 `/mnt/public/haoting/mrl-textgrad` 可作为教师导出来源。`memrl-tg` 当前不是本机可解析的 SSH 别名，不能直接把它写成可用连接命令。
 
 ms-swift 以锁定 commit 的依赖接入，Mem2W 的模型扩展、数据处理和 Trainer 留在本项目中。优先使用项目级子类和注册接口；如确需修改上游，用单独的可审查补丁记录。GitHub 组织、可见性与 remote 尚未指定，本计划不假定已建立远程仓库。
 
-建议目录（待实现）：
+当前目录（最小实现）：
 
 ```text
 Mem2W/
   pyproject.toml
   README.md
-  configs/
-    mem2w_qwen35_9b.yaml
-    smoke.yaml
-    ablations/{action_only,full_memory,strict_no_warmup}.yaml
-  src/mem2w/
-    model/{memory,configuration,qwen_adapter}.py
-    data/{schema,converter,swift_template,paired_collator}.py
-    swift/{pipeline,trainer,registration}.py
-    training/{loss,schedule,checkpoint,manifest}.py
-    cli/{preflight,prepare_data,sft,infer}.py
-  tests/{unit,integration}/
-  docs/{PLAN,DATA_CONTRACT,ACCEPTANCE}.md
-  scripts/{preflight,smoke,sft}.sh
+  configs/default.yaml
+  src/mem2w/{memory_layer,qwen_integration,checkpointing}.py
+  src/mem2w/{ms_swift_adapter,ms_swift_plugin,ms_swift_train}.py
+  tests/{test_memory_checkpoint,test_ms_swift_adapter}.py
+  docs/{PLAN,ms_swift_sft}.md
 ```
+
+完整双目标实现仍按下文的目标目录逐步扩展，不把当前单分支 runner 误标成 W/C Trainer。
 
 模型权重、真实教师正文、凭证、训练日志和结果不提交 Git。小型合成 fixture 可以提交，并明确标记其用途。
 
@@ -55,7 +49,7 @@ Mem2W/
 
 上述代码可在 [锁定的 ms-swift 源码](https://github.com/modelscope/ms-swift/tree/c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c/swift) 查看。具体子类方法和注册方式需在 P0 用锁定版本做契约测试；不能把 `external_plugins` 导入普通 Python 文件等同于完成模型/Trainer 注册。
 
-P0 将 ms-swift commit、Transformers 实际版本、PyTorch/Accelerate、Python、设备运行时、模型与 tokenizer revision 写入 runtime lock。`transformers>=5.2.0` 只是该上游版本的声明下界，最终采用通过 checkpoint 加载、模板和 backward 测试的固定版本。若运行机为 MetaX/MACA，先验证其 PyTorch 与混合注意力 kernel 的反传支持，再选择容器与执行路径。
+P0 将 ms-swift commit、Transformers 实际版本、PyTorch/Accelerate、Python、设备运行时、模型与 tokenizer revision 写入 runtime lock。当前远端 `clin-swift` 环境已验证 Python 3.12、PyTorch 2.14.0+cu130、Transformers 5.16.1、ms-swift 4.5.3；实际 4B/9B GPU 训练仍需独立资源预检。`transformers>=5.2.0` 只是该上游版本的声明下界，最终采用通过 checkpoint 加载、模板和 backward 测试的固定版本。
 
 ## 4. 模型层改造
 
@@ -113,7 +107,7 @@ H_out = H + (A V) W_O
 
 ### 6.1 接入架构
 
-实现项目 `Mem2WSft` pipeline 与 `Mem2WTrainer`，复用 ms-swift 模型/processor 加载、模板编码、训练参数、日志和分布式基础设施。memory 安装需在 optimizer/DDP 构建前完成，并在 ms-swift tuner 准备之后复核冻结状态，避免框架重新打开主干训练。
+当前已实现 `ms_swift_train.py` 的最小单流 runner，复用 ms-swift 模型/processor 加载、模板编码、训练参数、日志和 Trainer；memory 安装在 optimizer/DDP 构建前完成，并在 ms-swift tuner 准备之后复核冻结状态。它支持独立 `--mode action` 与 `--mode recall`，optimizer 只接收四个 memory 参数，并在结束时导出 `memory.safetensors`。项目 `Mem2WTrainer`、配对 dataset/collator 和 W/C 调度仍按本节后续目标实现。
 
 配对 dataset/collator 每次提供 action、recall 两组张量及各自 shift 后目标 token 数，metadata 留在审计侧，不传给模型。不能直接混合两份 JSONL 后依赖 stock SFT 的一个总平均 loss；那既改变权重，也不实现 recall 分支的梯度限制。
 
@@ -154,9 +148,9 @@ AdamW：lr `1e-4`、betas `(0.9,0.999)`、weight decay `0`、grad clip `1`；cos
 
 | 阶段 | 主要工作 | 完成条件 |
 |---|---|---|
-| P0：版本与仓库 | 建立代码结构、锁 ms-swift/模型/依赖、Muxi 环境预检 | 官方 9B 短输入 forward/backward 可执行；版本和设备信息落盘 |
-| P1：记忆层 | 数学模块、冻结、受控插入、保存/加载 | 零残差/旁路等价，K/V 同步置换不变，Q/K 梯度可达 |
-| P2：SFT 数据 | 固定 episode 接入、Swift 模板、mask 和长度审计 | 工具结构保留、无正文泄漏、失败与空召回可训练、无 silent truncation |
+| P0：版本与仓库 | 建立代码结构、锁 ms-swift/模型/依赖、Muxi 环境预检 | 最小 ms-swift 参数/插件契约已验证；官方 9B 短输入 forward/backward 仍待资源可用时执行 |
+| P1：记忆层 | 数学模块、冻结、受控插入、保存/加载 | 已完成零分支/冻结/四参数检查、真实 Qwen3.5 结构 attach smoke 和 safetensors round-trip |
+| P2：SFT 数据 | 固定 episode 接入、Swift 模板、mask 和长度审计 | 已完成 action/recall 转换、payload 泄漏检查和配置生成；完整 token 审计待真实模板样本补齐 |
 | P3：双目标 Trainer | 阶段、token 分母、累积、梯度、resume | paired gradient 与手工参考一致；C recall-only V/W_O 无梯度且不变 |
 | P4：真实模型集成 | 9B 短序列、缓存/padding、BF16/FP32、资源 profiling | 主干全部参数保持，reload 等价，cached/full-prefix 误差达标 |
 | P5：小样本 SFT | 少量合成未知规则与 action/recall 数据 | 可复现训练与自由生成报告，memory 开关干预和损失切片可解释 |
@@ -181,4 +175,4 @@ P5 的报告区分 teacher-forced NLL、自由 recall 格式/事实准确性与�
 
 启动真实实验前需确定：Muxi 具体 GPU/运行时与可用磁盘；教师 snapshot/数据位置及来源划分；模型权重的固定 revision；工具模板；验证集与 checkpoint 选择规则。首轮使用固定人工工具环境验证学习，再安排真实 benchmark。
 
-本轮交付状态：需求文档已读完，上游关键接口已核对，实施计划已形成。模型层、SFT Trainer 和 9B 训练验收均列为后续实现工作，不标记完成。
+本轮交付状态：需求文档已读完，上游关键接口已核对；可插拔 memory 层、两种独立 ms-swift SFT mode、冻结校验、插件注册、数据转换和 `memory.safetensors` 导出已实现。W/C 20%/80% 梯度调度、paired Trainer、正式 9B GPU 训练与完整 benchmark 仍不在本轮范围。

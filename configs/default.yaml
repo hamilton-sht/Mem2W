@@ -1,0 +1,80 @@
+project: Mem2W
+spec_version: "0.1"
+
+base_model:
+  model_id: Qwen/Qwen3.5-9B
+  revision_policy: resolve_once_and_lock
+  revision: null
+  loader_policy: official_checkpoint_first
+  text_only_inputs: true
+  backbone_dtype: bfloat16
+  freeze_all_original_parameters: true
+  enable_thinking: false
+
+teacher:
+  algorithm: MemRL
+  paper_version: 2601.03192v2
+  freeze_snapshot_during_distillation: true
+  writeback_during_distillation: false
+  retrieval_frequency: episode_start
+  default_k_requested_for_new_snapshot: 3
+  keep_success_and_failure: true
+  reward_weighting: false
+
+memory:
+  insert_after_block_1based: 16
+  insertion_index_0based: 15
+  slots: 512
+  query_key_dim: 256
+  value_dim: 256
+  persistent_independent_kv: true
+  query_projection_bias: false
+  output_projection_bias: false
+  affine_norm: false
+  rms_eps: 1.0e-6
+  trainable_gate: false
+  memory_dropout: 0.0
+  slot_rope: false
+  read_frequency: every_token
+  wq_init: xavier_uniform
+  key_init: normal_std_1.0
+  value_init: normal_std_0.02
+  output_init: zeros
+
+loss:
+  action: masked_autoregressive_cross_entropy
+  recall: payload_completion_cross_entropy
+  lambda_recall: 1.0
+  normalization: supervised_token_mean_per_branch
+  teacher_soft_logits_required: false
+
+schedule:
+  recipe: joint_warmup_then_recall_read_only
+  warmup_stage_fraction: 0.20
+  optimizer_step: after_both_branches_backward
+
+optimizer:
+  name: AdamW
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  lr_schedule: cosine
+  lr_warmup_fraction: 0.03
+
+training:
+  max_seq_length: 4096
+  microbatch_size_per_branch_per_device: 1
+  accumulation_steps_per_branch: 8
+  packing: false
+  use_cache: false
+  gradient_checkpointing_initially: false
+  total_logical_updates_pilot: 1000
+  validation_every_logical_updates: 100
+  seed: 42
+
+inference:
+  external_memory_access: false
+  decode_recall_before_action: false
+  online_parameter_updates: false
+  clear_cache_on_memory_change: true
