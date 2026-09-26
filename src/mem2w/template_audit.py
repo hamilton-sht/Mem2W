@@ -269,7 +269,7 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     # qwen3_5 appends a mandatory assistant-turn terminator.  Resolve its
     # actual token ids from the template rather than accepting an arbitrary
     # tail: otherwise a misplaced prompt/tool target could hide at the end.
-    suffix_ids, _ = template._encode_context_list(template.template_meta.suffix)
+    suffix_ids = template._encode_context_list(template.template_meta.suffix)[0]
     if not suffix_ids or len(suffix_ids) > len(input_ids):
         raise TemplateAuditError("qwen3_5 template suffix could not be resolved")
     suffix_start = len(input_ids) - len(suffix_ids)
