@@ -135,3 +135,21 @@ print(template.safe_decode(encoded["labels"]))
 ```
 
 应看到 action 的 user、tool response 是 `-100`，每个 assistant action（包括合法终止标记）有标签；recall 只有 payload completion 有标签。不要只依据 `loss=true` 的布尔值判断 mask 正确性。Qwen3.5 首版关闭 packing；混合 linear/full attention 的 var-len 行为以及跨样本状态隔离没有在 Mem2W wrapper 中验证之前，不要打开 `packing`。
+
+仓库提供了可复用的审计入口。它先在无训练依赖的情况下检查 JSONL 的结构化
+tool-call、`loss` 标记、payload hash 和 teacher payload 边界；传入 native
+ms-swift checkout 与本地模型后，还会真实编码 `qwen3_5`，验证 token-level
+`labels`、全关闭 loss 的零标签基线，以及 `tool_response` 不会产生监督标签：
+
+```bash
+PYTHONPATH=src python -m mem2w.template_audit \
+  --dataset data/ms_swift/action_train.jsonl \
+  --dataset data/ms_swift/recall_train.jsonl \
+  --source-episodes data/episodes.jsonl \
+  --model /mnt/public/model/Qwen3.5-4B \
+  --swift-root /path/to/ms-swift \
+  --report artifacts/template_audit.json
+```
+
+省略 `--model` 可在无 torch/transformers 的登录节点上执行纯结构审计；有
+`--model` 时不加载模型权重，只调用 processor/tokenizer，因此仍不会启动训练。
