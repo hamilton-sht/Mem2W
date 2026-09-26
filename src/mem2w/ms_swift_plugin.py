@@ -8,9 +8,10 @@ freezes the loaded backbone, attaches one Mem2W layer, and optionally restores
 ms-swift's ``tuner_type=full`` preparation; calling stock ``swift sft`` alone
 is a data/template smoke path and may reopen the backbone.
 
-This plugin deliberately does not implement the later paired W/C gradient
-schedule.  Use one independent ``--mode action`` or ``--mode recall`` config
-for the first end-to-end smoke run.
+This plugin remains the compatibility path for independent stock ``swift sft``
+smokes. The paired W/C schedule is implemented natively in the companion fork
+through ``swift mem2w-sft``; do not mix both JSONL streams into stock SFT and
+claim that it is the paired objective.
 
 Environment variables:
 

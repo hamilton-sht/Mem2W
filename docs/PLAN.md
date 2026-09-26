@@ -1,10 +1,10 @@
 # Mem2W 新仓库、模型改造与 ms-swift SFT 实施计划
 
-日期：2026-09-26 · 版本：v0.1 · 状态：最小两模式实现已完成；真实 9B 长跑与 W/C 调度仍待资源预检后验收。
+日期：2026-09-27 · 版本：v0.1 · 状态：模型层、数据管线、native W/C paired SFT 和 Muxi 4B smoke 已完成；正式 9B 长跑与 benchmark 仍待单独安排。
 
 ## 1. 本次交付与实施范围
 
-本次文档描述独立的 `Mem2W` 仓库、Qwen3.5-9B 模型层改造及基于 ms-swift 的双目标 SFT 计划。附件 [Mem2W 算法与需求 v0.1](/Users/haoting/Downloads/Mem2W_Qwen3.5_9B_Algorithm_and_Requirements_v0.1.md) 作为算法设计与验收依据。当前已经落地的是可插拔 memory 层、冻结主干、action/recall 两条独立 masked-CE SFT 通路和 `memory.safetensors` 导出；双分支 W/C 调度、正式 9B 训练和完整验收仍是后续工作。
+本次文档描述独立的 `Mem2W` 仓库、Qwen3.5-9B 模型层改造及基于 ms-swift 的双目标 SFT。附件 [Mem2W 算法与需求 v0.1](/Users/haoting/Downloads/Mem2W_Qwen3.5_9B_Algorithm_and_Requirements_v0.1.md) 作为算法设计与验收依据。当前已经落地的是可插拔 memory 层、冻结主干、action/recall 数据管线、`qwen3_5` 模板和 token mask 审计、native W/C paired trainer、`memory.safetensors` 导出及 Muxi Qwen3.5-4B 两步 GPU smoke。
 
 实现范围：持久 KV 记忆模块、受控模型接入、主干冻结、action/recall 数据接入、模板与 mask 验证、双分支 Trainer、检查点与恢复、最小推理验证。沿用已有 MemRL 系统导出的固定快照和日志，不在本阶段重写教师检索器或教师采集平台。
 
@@ -31,7 +31,7 @@ Mem2W/
   docs/{PLAN,ms_swift_sft}.md
 ```
 
-完整双目标实现仍按下文的目标目录逐步扩展，不把当前单分支 runner 误标成 W/C Trainer。
+正式双目标入口位于配套的 native ms-swift fork `/Users/haoting/Documents/ChatGPT/ms-swift-mem2w`，命令为 `swift mem2w-sft`；本仓库的 `mem2w-sft-train` 保留为独立 action/recall 单流兼容入口。
 
 模型权重、真实教师正文、凭证、训练日志和结果不提交 Git。小型合成 fixture 可以提交，并明确标记其用途。
 
@@ -107,11 +107,11 @@ H_out = H + (A V) W_O
 
 ### 6.1 接入架构
 
-当前已实现 `ms_swift_train.py` 的最小单流 runner，复用 ms-swift 模型/processor 加载、模板编码、训练参数、日志和 Trainer；memory 安装在 optimizer/DDP 构建前完成，并在 ms-swift tuner 准备之后复核冻结状态。它支持独立 `--mode action` 与 `--mode recall`，optimizer 只接收四个 memory 参数，并在结束时导出 `memory.safetensors`。项目 `Mem2WTrainer`、配对 dataset/collator 和 W/C 调度仍按本节后续目标实现。
+`ms_swift_train.py` 提供独立 action/recall 单流兼容 runner，复用 ms-swift 模型/processor、模板编码、训练参数和 Trainer；native fork 额外提供 `swift mem2w-sft`，复用同一套模型加载和 `qwen3_5` template/data collator，在 native Mem2W tuner 上实现配对 dataset、双分支 token 分母、W/C 梯度路由、单次逻辑 optimizer step 和原生 checkpoint/resume。
 
 配对 dataset/collator 每次提供 action、recall 两组张量及各自 shift 后目标 token 数，metadata 留在审计侧，不传给模型。不能直接混合两份 JSONL 后依赖 stock SFT 的一个总平均 loss；那既改变权重，也不实现 recall 分支的梯度限制。
 
-仅重写 `compute_loss` 通常不足以实现顺序 backward、累积与保存：计划同时扩展训练步、batch 获取/分母统计、optimizer 校验和检查点处理。具体 override 点在固定上游版本中逐一测试，避免全局 monkey patch。
+因此 native 入口不把两份 JSONL 混入 stock SFT，而是在同一模型和 template 上显式编码两条流，再执行 paired logical update。普通 `swift sft --tuner_type mem2w` 仍保留为单流兼容 smoke path。
 
 ### 6.2 损失与阶段
 
@@ -148,11 +148,11 @@ AdamW：lr `1e-4`、betas `(0.9,0.999)`、weight decay `0`、grad clip `1`；cos
 
 | 阶段 | 主要工作 | 完成条件 |
 |---|---|---|
-| P0：版本与仓库 | 建立代码结构、锁 ms-swift/模型/依赖、Muxi 环境预检 | 最小 ms-swift 参数/插件契约已验证；官方 9B 短输入 forward/backward 仍待资源可用时执行 |
+| P0：版本与仓库 | 建立代码结构、锁 ms-swift/模型/依赖、Muxi 环境预检 | 已验证 native fork、Transformers 5.16.1、MACA 容器和 4×C500；9B 长跑仍未启动 |
 | P1：记忆层 | 数学模块、冻结、受控插入、保存/加载 | 已完成零分支/冻结/四参数检查、真实 Qwen3.5 结构 attach smoke 和 safetensors round-trip |
-| P2：SFT 数据 | 固定 episode 接入、Swift 模板、mask 和长度审计 | 已完成 action/recall 转换、payload 泄漏检查和配置生成；完整 token 审计待真实模板样本补齐 |
-| P3：双目标 Trainer | 阶段、token 分母、累积、梯度、resume | paired gradient 与手工参考一致；C recall-only V/W_O 无梯度且不变 |
-| P4：真实模型集成 | 9B 短序列、缓存/padding、BF16/FP32、资源 profiling | 主干全部参数保持，reload 等价，cached/full-prefix 误差达标 |
+| P2：SFT 数据 | 固定 episode 接入、Swift 模板、mask 和长度审计 | 已完成 action/recall 转换、tool-call/payload 泄漏检查和 qwen3_5 token-level 审计 |
+| P3：双目标 Trainer | 阶段、token 分母、累积、梯度、resume | native paired W/C 两步 Muxi smoke 通过；W/C 日志、四参数、checkpoint/resume 产物已验证 |
+| P4：真实模型集成 | 4B/9B 短序列、缓存/padding、BF16/FP32、资源 profiling | 4B BF16 两步 GPU smoke 通过；9B 长跑、cached/full-prefix 误差仍待单独验收 |
 | P5：小样本 SFT | 少量合成未知规则与 action/recall 数据 | 可复现训练与自由生成报告，memory 开关干预和损失切片可解释 |
 
 P1 数学测试与 P2 数据处理可在 P0 接口明确后并行；P3 依赖二者。P4 通过前不启动长 pilot。
@@ -175,4 +175,4 @@ P5 的报告区分 teacher-forced NLL、自由 recall 格式/事实准确性与�
 
 启动真实实验前需确定：Muxi 具体 GPU/运行时与可用磁盘；教师 snapshot/数据位置及来源划分；模型权重的固定 revision；工具模板；验证集与 checkpoint 选择规则。首轮使用固定人工工具环境验证学习，再安排真实 benchmark。
 
-本轮交付状态：需求文档已读完，上游关键接口已核对；可插拔 memory 层、两种独立 ms-swift SFT mode、冻结校验、插件注册、数据转换和 `memory.safetensors` 导出已实现。W/C 20%/80% 梯度调度、paired Trainer、正式 9B GPU 训练与完整 benchmark 仍不在本轮范围。
+本轮交付状态：需求文档已读完，上游关键接口已核对；可插拔 memory 层、两种独立 ms-swift SFT mode、冻结校验、native tuner 注册、数据转换、qwen3_5/tool-call/loss-mask 审计、native W/C paired Trainer、checkpoint/resume 和 `memory.safetensors` 导出均已实现。Muxi 上 Qwen3.5-4B 已完成两步 BF16 paired GPU smoke；正式 9B 长跑与 benchmark 不属于 smoke 验收，后续可直接复用同一入口。
