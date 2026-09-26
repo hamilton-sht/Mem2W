@@ -265,8 +265,20 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     if baseline.get("input_ids") != input_ids:
         raise TemplateAuditError("loss flags changed qwen3_5 input rendering")
     baseline_labels = baseline.get("labels") or []
-    if any(label != -100 for label in baseline_labels):
-        raise TemplateAuditError("qwen3_5 emitted labels with all message losses disabled")
+    baseline_targets = [index for index, label in enumerate(baseline_labels) if label != -100]
+    # qwen3_5 appends a mandatory assistant-turn terminator.  Depending on
+    # the tokenizer this can contribute one or two labels even when every
+    # message has ``loss=false``.  Those suffix labels are template-owned,
+    # not supervision from a prompt/tool span; reject any non-contiguous
+    # interior targets while preserving the real assistant mask check below.
+    if baseline_targets:
+        expected_suffix = list(range(baseline_targets[0], len(baseline_labels)))
+        if baseline_targets != expected_suffix:
+            raise TemplateAuditError(
+                "qwen3_5 emitted non-suffix labels with all message losses disabled")
+    original_targets = [index for index, label in enumerate(labels) if label != -100]
+    if not set(baseline_targets).issubset(original_targets):
+        raise TemplateAuditError("qwen3_5 dropped template-owned suffix labels")
 
     # Explicitly mark only tool responses as targets. They remain query-side
     # context in qwen3_5 and must never produce labels.
@@ -275,7 +287,9 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(message, MutableMapping) and _role(message) == "tool_response":
             message["loss"] = True
     tool_encoded = _encode(template, tool_only)
-    if any(label != -100 for label in (tool_encoded.get("labels") or [])):
+    tool_labels = tool_encoded.get("labels") or []
+    tool_targets = [index for index, label in enumerate(tool_labels) if label != -100]
+    if tool_targets != baseline_targets:
         raise TemplateAuditError("tool_response loss leaked into target labels")
     transformed = encoded.get("template_inputs")
     transformed_messages = getattr(transformed, "messages", []) if transformed is not None else []
@@ -286,6 +300,7 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "tokens": len(input_ids),
         "target_tokens": target_count,
+        "template_suffix_targets": len(baseline_targets),
         "transformed_messages": len(transformed_messages),
         "tool_call_blocks": len(tool_call_rendered),
     }
@@ -389,4 +404,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
