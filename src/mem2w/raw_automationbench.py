@@ -239,8 +239,52 @@ def parse_trajectory(value: Any) -> list[dict[str, Any]]:
         role = row.get("role")
         if not isinstance(role, str) or not role.strip():
             raise RawImportError(f"trajectory[{index}] is missing role")
+        # AutomationBench exports can encode OpenAI tool calls as JSON strings
+        # inside ``tool_calls``.  ms-swift's normalizer expects objects and
+        # calls ``.get`` on each entry, so normalize them at the import
+        # boundary and fail closed on malformed/non-object arguments.
+        tool_calls = row.get("tool_calls")
+        if tool_calls is not None:
+            if not isinstance(tool_calls, list):
+                raise RawImportError(f"trajectory[{index}].tool_calls must be a list")
+            normalized_calls = []
+            for call_index, call in enumerate(tool_calls):
+                if isinstance(call, str):
+                    try:
+                        call = json.loads(call)
+                    except json.JSONDecodeError as exc:
+                        raise RawImportError(
+                            f"trajectory[{index}].tool_calls[{call_index}] is invalid JSON") from exc
+                if not isinstance(call, Mapping):
+                    raise RawImportError(f"trajectory[{index}].tool_calls[{call_index}] must be an object")
+                call = dict(call)
+                function = call.get("function", call)
+                if isinstance(function, str):
+                    try:
+                        function = json.loads(function)
+                    except json.JSONDecodeError as exc:
+                        raise RawImportError(
+                            f"trajectory[{index}].tool_calls[{call_index}].function is invalid JSON") from exc
+                if not isinstance(function, Mapping) or not str(function.get("name", "")).strip():
+                    raise RawImportError(
+                        f"trajectory[{index}].tool_calls[{call_index}] is missing function.name")
+                function = dict(function)
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError as exc:
+                        raise RawImportError(
+                            f"trajectory[{index}].tool_calls[{call_index}].arguments is invalid JSON") from exc
+                if not isinstance(arguments, Mapping):
+                    raise RawImportError(
+                        f"trajectory[{index}].tool_calls[{call_index}].arguments must be an object")
+                function["arguments"] = dict(arguments)
+                call["function"] = function
+                normalized_calls.append(call)
+            row["tool_calls"] = normalized_calls
         # ``serialize_trajectory`` emits these keys even when null.  Keep
-        # tool_calls and tool_call_id exactly; only reasoning is removed.
+        # structured tool fields and tool_call_id; only reasoning is removed.
         messages.append(row)
     return messages
 
