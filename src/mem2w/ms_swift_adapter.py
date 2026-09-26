@@ -109,8 +109,15 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
 def _normalise_split(value: Any) -> str:
     """Normalise split names without silently moving test data into train."""
 
-    if value is None or value == "":
-        return "train"
+    # The MemRL export records the source split.  Silently treating a missing
+    # split as train would make a held-out episode part of the SFT corpus and
+    # is especially dangerous when the export is assembled from multiple
+    # epochs.  ``data_contract`` has always required this field; keep the
+    # adapter consistent with that contract.
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise Mem2WDataError("episode.split is required; refusing to default a missing split to train")
+    if isinstance(value, bool):
+        raise Mem2WDataError("episode.split must be a string")
     split = str(value).strip().lower().replace("-", "_")
     aliases = {"valid": "validation", "dev": "validation", "eval": "validation"}
     return aliases.get(split, split)
@@ -157,13 +164,27 @@ def _copy_message(message: Mapping[str, Any], *, loss: Optional[bool] = None) ->
 
 def _retrieval_payloads(episode: Mapping[str, Any]) -> List[str]:
     payloads: List[str] = []
-    for event in episode.get("retrieval_events", []) or []:
+    for event in _episode_retrieval_events(episode):
         if not isinstance(event, Mapping):
             continue
         payload = event.get("injected_context_text")
         if payload is not None:
             payloads.append(_as_text(payload))
     return payloads
+
+
+def _episode_retrieval_events(episode: Mapping[str, Any]) -> Any:
+    """Return the normalized retrieval-event list from common runner aliases."""
+
+    events = episode.get("retrieval_events")
+    if events is None:
+        # ``retrieval_records`` is the name used by some MemRL exports.  It is
+        # an alias only: the event objects still need query/payload fields and
+        # are validated by ``_recall_messages``.
+        events = episode.get("retrieval_records")
+    if events is None:
+        events = episode.get("retrievals")
+    return events or []
 
 
 def _prompt_contains_payload(messages: Sequence[Mapping[str, Any]], payloads: Sequence[str]) -> Optional[str]:
@@ -182,17 +203,28 @@ def _prompt_contains_payload(messages: Sequence[Mapping[str, Any]], payloads: Se
 def _task_prefix(episode: Mapping[str, Any]) -> List[Dict[str, Any]]:
     task = episode.get("task")
     if not isinstance(task, Mapping):
-        raise Mem2WDataError("episode.task must be an object when messages do not contain a user turn")
+        task = {}
+    # The MemRL runner calls this field ``_memq_task_description``.  The
+    # normalized contract uses ``task.query``; accepting both lets the
+    # converter consume a frozen runner export without fabricating a task.
     query = task.get("query")
     if query is None:
         query = task.get("initial_query")
     if query is None:
-        raise Mem2WDataError("episode.task.query is required when messages do not contain a user turn")
+        query = episode.get("_memq_task_description")
+    if query is None:
+        query = episode.get("task_description")
+    if query is None:
+        raise Mem2WDataError(
+            "episode.task.query or _memq_task_description is required when messages do not contain a user turn"
+        )
     content = _as_text(query)
     initial = task.get("initial_observation")
     if initial not in (None, ""):
         content = f"{content}\n\n初始观察：\n{_as_text(initial)}"
     system = task.get("system") or task.get("system_prompt")
+    if system is None:
+        system = episode.get("system_prompt")
     result: List[Dict[str, Any]] = []
     if system not in (None, ""):
         result.append({"role": "system", "content": _as_text(system)})
@@ -202,8 +234,24 @@ def _task_prefix(episode: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 def _action_messages(episode: Mapping[str, Any], source: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     raw_messages = episode.get("messages")
+    # Some runner exports wrap the serialized trajectory under ``output`` or
+    # ``trajectory``.  We only accept structured message lists here; a free
+    # form serialized trajectory cannot be converted without guessing role
+    # boundaries and is rejected below with a useful error.
     if raw_messages is None:
-        raise Mem2WDataError(f"{source}: episode.messages is required for action supervision")
+        for container_name in ("output", "trajectory"):
+            container = episode.get(container_name)
+            if isinstance(container, Mapping) and isinstance(container.get("messages"), list):
+                raw_messages = container["messages"]
+                break
+            if isinstance(container, list):
+                raw_messages = container
+                break
+    if raw_messages is None:
+        raise Mem2WDataError(
+            f"{source}: structured episode.messages (or output/trajectory.messages) is required; "
+            "a serialized trajectory string cannot be split into action labels safely"
+        )
     if not isinstance(raw_messages, list) or not raw_messages:
         raise Mem2WDataError(f"{source}: episode.messages must be a non-empty list")
     for index, message in enumerate(raw_messages):
@@ -229,7 +277,11 @@ def _action_messages(episode: Mapping[str, Any], source: str) -> Tuple[List[Dict
         is_teacher_memory = (
             role == "memory"
             or isinstance(metadata, Mapping)
-            and (metadata.get("source") == "teacher_memory" or metadata.get("is_teacher_memory") is True)
+            and (
+                metadata.get("source") in {"teacher_memory", "retrieved_memory", "memory_retrieval"}
+                or metadata.get("is_teacher_memory") is True
+                or metadata.get("is_retrieved_memory") is True
+            )
         )
         if is_teacher_memory:
             # Removing by role/metadata is intentional.  A global text replace
@@ -262,6 +314,7 @@ def _action_messages(episode: Mapping[str, Any], source: str) -> Tuple[List[Dict
         "split": _normalise_split(episode.get("split")),
         "prompt_version": (episode.get("teacher") or {}).get("prompt_version") if isinstance(episode.get("teacher"), Mapping) else None,
     }
+    extra.update(_research_audit_metadata(episode))
     return messages, extra
 
 
@@ -278,13 +331,24 @@ def _recall_prompt(query: str, k_requested: int) -> str:
 def _recall_messages(episode: Mapping[str, Any], event: Mapping[str, Any], source: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     query = event.get("query_text")
     payload = event.get("injected_context_text")
-    if query is None:
+    if query is None or not _as_text(query).strip():
         raise Mem2WDataError(f"{source}: retrieval event is missing query_text")
     if payload is None:
         raise Mem2WDataError(f"{source}: retrieval event is missing injected_context_text")
     k_requested = event.get("k_requested")
     if isinstance(k_requested, bool) or not isinstance(k_requested, int):
         raise Mem2WDataError(f"{source}: k_requested must be an integer")
+    if k_requested < 0:
+        raise Mem2WDataError(f"{source}: k_requested must be non-negative")
+    k_returned = event.get("k_returned")
+    if k_returned is not None:
+        if isinstance(k_returned, bool) or not isinstance(k_returned, int) or k_returned < 0:
+            raise Mem2WDataError(f"{source}: k_returned must be a non-negative integer")
+        if k_returned > k_requested:
+            raise Mem2WDataError(f"{source}: k_returned cannot exceed k_requested")
+    selected_ids = event.get("selected_memory_ids")
+    if selected_ids is not None and not isinstance(selected_ids, list):
+        raise Mem2WDataError(f"{source}: selected_memory_ids must be a list when present")
     payload_text = _as_text(payload)
     if not payload_text.strip():
         raise Mem2WDataError(f"{source}: recall payload cannot be empty; encode no-hit as {{\"memories\":[]}}")
@@ -300,12 +364,53 @@ def _recall_messages(episode: Mapping[str, Any], event: Mapping[str, Any], sourc
         "source_retrieval_event_id": event.get("event_id"),
         "memory_snapshot_id": episode.get("memory_snapshot_id"),
         "retrieval_k_requested": k_requested,
-        "retrieval_k_returned": event.get("k_returned"),
+        "retrieval_k_returned": k_returned,
+        "selected_memory_ids": list(selected_ids) if selected_ids is not None else None,
         "payload_sha256": hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
         "split": _normalise_split(episode.get("split")),
         "prompt_version": (episode.get("teacher") or {}).get("prompt_version") if isinstance(episode.get("teacher"), Mapping) else None,
     }
+    extra.update(_research_audit_metadata(episode))
     return messages, extra
+
+
+def _research_audit_metadata(episode: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy provenance fields from the MemRL runner without duplicating payloads.
+
+    The 0916 MemRL baseline stores useful diagnostics next to the trajectory:
+    task/epoch identity, exact/partial reward, retrieval IDs and scalar-Q
+    bookkeeping.  These fields are audit metadata only; they are deliberately
+    not converted into prompt messages or loss labels.  Keeping them in the
+    derived JSONL makes split filtering and post-run attribution possible.
+    """
+
+    outcome = episode.get("outcome")
+    outcome = outcome if isinstance(outcome, Mapping) else {}
+    diagnostics = episode.get("diagnostics")
+    if diagnostics is None:
+        diagnostics = outcome.get("diagnostics")
+    partial_credit = episode.get("partial_credit", outcome.get("partial_credit"))
+    partial_diagnostic = episode.get("partial_credit_diagnostic", outcome.get("partial_credit_diagnostic"))
+    retrieved_ids = episode.get("_memq_retrieved_ids")
+    if retrieved_ids is None:
+        retrieved_ids = episode.get("retrieved_memory_ids")
+    result: Dict[str, Any] = {
+        "task_id": episode.get("task_id"),
+        "task_family": episode.get("task_family"),
+        "epoch": episode.get("epoch"),
+        "task_description": episode.get("_memq_task_description", episode.get("task_description")),
+        "partial_credit": partial_credit,
+        "partial_credit_diagnostic": partial_diagnostic,
+        "diagnostics": diagnostics,
+        "reflection_diagnostics": episode.get("reflection_diagnostics", outcome.get("reflection_diagnostics")),
+        "source_algorithm": episode.get("source_algorithm", "memrl"),
+        "retrieved_memory_ids": list(retrieved_ids) if isinstance(retrieved_ids, list) else retrieved_ids,
+        "q_value": episode.get("q_value"),
+        "q_visits": episode.get("q_visits"),
+    }
+    # Avoid writing a dozen null columns into every row.  ``source_algorithm``
+    # is retained when present (or defaults to the research run's baseline).
+    return {key: value for key, value in result.items() if value is not None}
 
 
 def _sample_row(messages: List[Dict[str, Any]], metadata: Mapping[str, Any]) -> Dict[str, Any]:
@@ -338,6 +443,7 @@ def convert_episodes(input_path: os.PathLike[str] | str, output_dir: os.PathLike
 
     buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     source_rows = 0
+    recall_missing_payload = 0
     for line_no, episode in _read_jsonl(source_path):
         source_rows += 1
         source = f"{source_path}:{line_no}"
@@ -349,16 +455,28 @@ def convert_episodes(input_path: os.PathLike[str] | str, output_dir: os.PathLike
         split = _normalise_split(episode.get("split"))
         buckets.setdefault(("action", split), []).append(_sample_row(action_messages, action_meta))
 
-        events = episode.get("retrieval_events") or []
+        events = _episode_retrieval_events(episode)
         if not isinstance(events, list):
             raise Mem2WDataError(f"{source}: retrieval_events must be a list")
         for event_index, event in enumerate(events):
             if not isinstance(event, Mapping):
                 raise Mem2WDataError(f"{source}: retrieval_events[{event_index}] must be an object")
             event_source = f"{source} retrieval_events[{event_index}]"
+            event_id = event.get("event_id")
+            if event_id is None or not str(event_id).strip():
+                raise Mem2WDataError(f"{event_source}: event_id is required for retrieval provenance")
+            # Raw AutomationBench imports intentionally keep an action-ready
+            # episode when actor prompt capture was incomplete.  Such an event
+            # is not a valid recall target; skip only the recall row and retain
+            # the action row.  Never substitute retrieval_records for payload.
+            if event.get("recall_missing_payload") is True or not str(event.get("injected_context_text") or "").strip():
+                if event.get("recall_missing_payload") is True:
+                    recall_missing_payload += 1
+                    continue
+                raise Mem2WDataError(f"{event_source}: retrieval event has an empty injected_context_text")
             recall_messages, recall_meta = _recall_messages(episode, event, event_source)
             recall_meta["source_episode_id"] = str(episode_id)
-            recall_meta["source_retrieval_event_id"] = str(event.get("event_id") or f"{episode_id}:ret-{event_index}")
+            recall_meta["source_retrieval_event_id"] = str(event_id)
             buckets.setdefault(("recall", split), []).append(_sample_row(recall_messages, recall_meta))
 
     files: Dict[str, Dict[str, Any]] = {}
@@ -372,6 +490,7 @@ def convert_episodes(input_path: os.PathLike[str] | str, output_dir: os.PathLike
         "ms_swift_main_commit": MS_SWIFT_MAIN_COMMIT,
         "source": {"path": str(source_path), "sha256": _sha256_file(source_path), "episodes": source_rows},
         "files": files,
+        "qa": {"recall_missing_payload": recall_missing_payload},
         "constraints": {
             "action_prompt_excludes_teacher_payload": True,
             "recall_target_is_exact_injected_context_text": True,

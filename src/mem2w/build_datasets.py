@@ -20,12 +20,18 @@ def build_datasets(episodes_path: str | Path, output_dir: str | Path, *, recall_
     action_rows = []
     recall_rows = []
     episode_count = 0
+    recall_missing_payload = 0
     for episode in read_jsonl(episodes_path):
         episode_count += 1
         action_rows.append(build_action_sample(episode).as_dict())
+        events = episode.get("retrieval_events") or episode.get("retrieval_records") or episode.get("retrievals") or []
+        recall_missing_payload += sum(
+            1 for event in events
+            if isinstance(event, dict) and event.get("recall_missing_payload") is True
+        )
         recall_rows.extend(sample.as_dict() for sample in build_recall_samples(episode, recall_system))
-    if not action_rows or not recall_rows:
-        raise ValueError("episodes must yield at least one action and one recall sample")
+    if not action_rows:
+        raise ValueError("episodes must yield at least one action sample")
     write_jsonl(output / "action.jsonl", action_rows)
     write_jsonl(output / "recall.jsonl", recall_rows)
     manifest = {
@@ -34,6 +40,7 @@ def build_datasets(episodes_path: str | Path, output_dir: str | Path, *, recall_
         "episodes": episode_count,
         "action_samples": len(action_rows),
         "recall_samples": len(recall_rows),
+        "recall_missing_payload": recall_missing_payload,
         "recall_system_prompt": recall_system,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
