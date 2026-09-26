@@ -151,7 +151,7 @@ AdamW：lr `1e-4`、betas `(0.9,0.999)`、weight decay `0`、grad clip `1`；cos
 | P0：版本与仓库 | 建立代码结构、锁 ms-swift/模型/依赖、Muxi 环境预检 | 已验证 native fork、Transformers 5.16.1、MACA 容器和 4×C500；9B 长跑仍未启动 |
 | P1：记忆层 | 数学模块、冻结、受控插入、保存/加载 | 已完成零分支/冻结/四参数检查、真实 Qwen3.5 结构 attach smoke 和 safetensors round-trip |
 | P2：SFT 数据 | 固定 episode 接入、Swift 模板、mask 和长度审计 | 已完成 action/recall 转换、tool-call/payload 泄漏检查和 qwen3_5 token-level 审计 |
-| P3：双目标 Trainer | 阶段、token 分母、累积、梯度、resume | native paired W/C 两步 Muxi smoke 通过；W/C 日志、四参数、checkpoint/resume 产物已验证 |
+| P3：双目标 Trainer | 阶段、token 分母、累积、梯度、scheduler、resume | native paired W/C 两步 Muxi smoke 通过；梯度路由断言、W/C 日志、四参数、checkpoint/resume 等价性已验证 |
 | P4：真实模型集成 | 4B/9B 短序列、缓存/padding、BF16/FP32、资源 profiling | 4B BF16 两步 GPU smoke 通过；9B 长跑、cached/full-prefix 误差仍待单独验收 |
 | P5：小样本 SFT | 少量合成未知规则与 action/recall 数据 | 可复现训练与自由生成报告，memory 开关干预和损失切片可解释 |
 

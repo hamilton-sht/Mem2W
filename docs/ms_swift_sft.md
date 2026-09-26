@@ -142,9 +142,12 @@ python swift/cli/main.py mem2w-sft \
 
 `swift mem2w-sft` 的 W 阶段让两个分支更新 `W_Q/K/V/W_O`；C 阶段仅对 recall
 分支 detach `V/W_O`，保留 `W_Q/K` 的梯度。每个分支先按自身有效 label token
-数归一化，再乘 `lambda_recall`；每个逻辑 step 只执行一次 optimizer step。每一步
-输出 `checkpoint-N/memory.safetensors`、`mem2w_config.json`、`optimizer.pt` 和
-`mem2w_dual_state.json`，可以用 `--resume-from-checkpoint` 恢复。普通 `swift sft`
+总数归一化（默认每分支 8 个 microbatch），再乘 `lambda_recall`；每个逻辑 step
+只执行一次 optimizer step，并按 cosine/LR warmup 更新 scheduler。每一步输出
+`checkpoint-N/memory.safetensors`、`mem2w_config.json`、`optimizer.pt`、
+`scheduler.pt`、`rng_state.pt` 和 `mem2w_dual_state.json`，可以用
+`--resume-from-checkpoint` 恢复；`training_metrics.jsonl` 和
+`training_summary.json` 保留逐步指标。普通 `swift sft`
 和此入口共享同一个 native `mem2w` tuner 与四参数 checkpoint 格式。
 
 ## 4. token mask 验证
