@@ -266,16 +266,19 @@ def _assert_token_mask(template: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         raise TemplateAuditError("loss flags changed qwen3_5 input rendering")
     baseline_labels = baseline.get("labels") or []
     baseline_targets = [index for index, label in enumerate(baseline_labels) if label != -100]
-    # qwen3_5 appends a mandatory assistant-turn terminator.  Depending on
-    # the tokenizer this can contribute one or two labels even when every
-    # message has ``loss=false``.  Those suffix labels are template-owned,
-    # not supervision from a prompt/tool span; reject any non-contiguous
-    # interior targets while preserving the real assistant mask check below.
-    if baseline_targets:
-        expected_suffix = list(range(baseline_targets[0], len(baseline_labels)))
-        if baseline_targets != expected_suffix:
-            raise TemplateAuditError(
-                "qwen3_5 emitted non-suffix labels with all message losses disabled")
+    # qwen3_5 appends a mandatory assistant-turn terminator.  Resolve its
+    # actual token ids from the template rather than accepting an arbitrary
+    # tail: otherwise a misplaced prompt/tool target could hide at the end.
+    suffix_ids, _ = template._encode_context_list(template.template_meta.suffix)
+    if not suffix_ids or len(suffix_ids) > len(input_ids):
+        raise TemplateAuditError("qwen3_5 template suffix could not be resolved")
+    suffix_start = len(input_ids) - len(suffix_ids)
+    expected_suffix = list(range(suffix_start, len(input_ids)))
+    if baseline_targets != expected_suffix:
+        raise TemplateAuditError(
+            "qwen3_5 emitted labels outside its exact template suffix with all message losses disabled")
+    if input_ids[suffix_start:] != suffix_ids:
+        raise TemplateAuditError("qwen3_5 encoded suffix tokens do not match template metadata")
     original_targets = [index for index, label in enumerate(labels) if label != -100]
     if not set(baseline_targets).issubset(original_targets):
         raise TemplateAuditError("qwen3_5 dropped template-owned suffix labels")
