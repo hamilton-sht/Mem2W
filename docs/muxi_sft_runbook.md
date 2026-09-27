@@ -101,6 +101,23 @@ export PYTHONPATH=/mnt/public/haoting/venvs/mem2w-smoke/lib/python3.10/site-pack
 单进程、`device_map=auto` 的四卡模型并行也已验证。完整数据前缀的 164096-token
 recall 可以完成实际 W/C 两步训练：
 
+```bash
+unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export PYTHONPATH=/mnt/public/haoting/venvs/mem2w-smoke/lib/python3.10/site-packages:/mnt/public/haoting/ms-swift-mem2w
+
+/mnt/public/haoting/venvs/mem2w-smoke/bin/python \
+  /mnt/public/haoting/ms-swift-mem2w/swift/cli/mem2w_sft.py \
+  --model /mnt/public/model/Qwen3.5-4B \
+  --action-dataset /mnt/public/haoting/mem2w_data/automationbench_0916/action_train.jsonl \
+  --recall-dataset /mnt/public/haoting/mem2w_data/automationbench_0916/recall_train.jsonl \
+  --output-dir /mnt/public/haoting/mem2w_data/lossless_mp_w_c_0927 \
+  --template qwen3_5 --max-length 262144 --max-steps 2 \
+  --warmup-fraction 0.5 --accumulation-steps 1 \
+  --attn-impl flash_attn --gradient-checkpointing \
+  --loss-chunk-size 256 --lazy-encode
+```
+
 ```text
 /mnt/public/haoting/mem2w_data/lossless_mp_w_c_0927
 step 1: W, 164096 recall tokens, completed
