@@ -88,9 +88,7 @@ archive_root = /mnt/public/code/haoting/mrl-textgrad-archive/0916_memrl_96+24_ds
 mem2w-convert-automationbench-0916 \
   --result-root /mnt/public/haoting/mrl-textgrad/results/automationbench/0916_memrl_96+24_ds0731 \
   --archive-root /mnt/public/code/haoting/mrl-textgrad-archive/0916_memrl_96+24_ds0731 \
-  --output-dir /mnt/public/haoting/mem2w_data/automationbench_0916 \
-  --payload-budget-chars 12000 \
-  --action-context-budget-chars 16000
+  --output-dir /mnt/public/haoting/mem2w_data/automationbench_0916
 ```
 
 该转换器的两个输出流与 native paired trainer 对应：
@@ -109,10 +107,10 @@ W 样本使用完整 trajectory 的可见前缀；历史 assistant/tool response
 上下文。该映射在归档的 27 条 actor prompt 抽样上逐字 hash 校验为 27/27；ID、相似度
 和 Q 值只保留为审计字段。
 
-由于原始 W 前缀和 C payload 很长，转换器对历史上下文和 recall target 采用显式头尾
-压缩，并保留 `context_original_chars`、`payload_original_chars`、`payload_sha256`、
-`*_compacted` 等字段。这样 ms-swift 不会静默截断；如果要做 exact teacher-payload
-复现实验，应把预算提高并单独处理超长样本，而不是直接使用默认 `max_length`。
+转换器逐字保留原始 W 前缀、tool JSON 和 C recall target，不做截断、头尾压缩或自动
+分片；同时在 metadata/`qa.json` 中保留完整长度统计与 `payload_sha256`。因此训练入口
+必须显式设置足够的 `max_length`，并使用 `truncation_strategy=raise`，让超过模型上下文
+上限的样本直接报错而不是改变监督目标。
 
 ## 质量门
 
