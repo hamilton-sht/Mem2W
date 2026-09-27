@@ -86,3 +86,8 @@ parallel/长序列内存优化或按样本调度到更大显存，而不是修�
 paired trainer 是一进程一设备的 memory-only trainer，4 卡可以做 data parallel
 式的后续扩展，但还没有在本次 smoke 中宣称 212k-token 样本的单卡全量反向已完成。
 
+边界探测的实际记录是：最长 `hr.visa_expiration_monitoring:epoch:1:train:recall`
+在 212062 tokens 时于 C500 64-GiB 单卡 OOM（PyTorch 已分配约 52.88 GiB，下一次
+分配需要 1.62 GiB）。因此当前“全链路打通”的验收口径是数据无损、模板/mask/hash
+预检通过、短无损 paired W/C smoke 和 checkpoint 通过；不是宣称最长样本已经完成
+单卡训练。
