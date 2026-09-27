@@ -67,6 +67,35 @@ python /mnt/public/haoting/ms-swift-mem2w/swift/cli/mem2w_sft.py \
   --loss-chunk-size 256 --lazy-encode
 ```
 
+## 多卡并行（已验证 2 卡和 4 卡）
+
+Muxi 的 NCCL backend 在 2 张和 4 张 C500 上均完成 CUDA tensor all-reduce。native
+paired trainer 对四个 Mem2W 参数显式做梯度平均，并按 rank 分片 action/recall
+行；只有 rank 0 写 checkpoint。由于 ms-swift 在多卡可见时会默认尝试 MP+DDP，当前
+Qwen3.5 环境还需要关闭这个自动 MP 分支：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export SWIFT_SINGLE_DEVICE_MODE=1
+export PYTHONPATH=/mnt/public/haoting/venvs/mem2w-smoke/lib/python3.10/site-packages:/mnt/public/haoting/ms-swift-mem2w
+
+/mnt/public/haoting/venvs/mem2w-smoke/bin/python -m torch.distributed.run \
+  --standalone --nproc_per_node=4 \
+  /mnt/public/haoting/ms-swift-mem2w/swift/cli/mem2w_sft.py \
+  --model /mnt/public/model/Qwen3.5-4B \
+  --action-dataset /mnt/public/haoting/mem2w_data/automationbench_0916_smoke/action_train.jsonl \
+  --recall-dataset /mnt/public/haoting/mem2w_data/automationbench_0916_smoke/recall_train.jsonl \
+  --output-dir /mnt/public/haoting/mem2w_data/lossless_ddp4_0927 \
+  --template qwen3_5 --max-length 32768 --max-steps 2 \
+  --warmup-fraction 0.5 --accumulation-steps 1 \
+  --attn-impl flash_attn --gradient-checkpointing \
+  --loss-chunk-size 256 --lazy-encode --distributed-backend nccl
+```
+
+该命令已在 4 卡上完成 W/C 两步，并生成两个 rank-0 checkpoint。多卡数据并行会
+提高吞吐并让不同样本分布到不同卡，但不会把一个 212k-token 样本自动切到多张卡；
+最长无损样本仍需要 sequence parallel 或模型/激活切分才能解决单样本 OOM。
+
 正式全量运行前必须保留完整 context，并先读取 `preflight_full_0927.json`：
 
 ```bash
