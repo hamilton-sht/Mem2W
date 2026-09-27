@@ -370,7 +370,7 @@ def convert_0916(
     }
     (output_dir / "qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     manifest = {
-        "format": "mem2w-automationbench-0916-single-step-v1",
+        "format": "mem2w-automationbench-0916-single-step-lossless-v2",
         "source": {
             "result_root": str(result_root),
             "archive_root": str(archive_root),
