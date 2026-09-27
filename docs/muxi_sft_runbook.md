@@ -96,6 +96,23 @@ export PYTHONPATH=/mnt/public/haoting/venvs/mem2w-smoke/lib/python3.10/site-pack
 提高吞吐并让不同样本分布到不同卡，但不会把一个 212k-token 样本自动切到多张卡；
 最长无损样本仍需要 sequence parallel 或模型/激活切分才能解决单样本 OOM。
 
+## 四卡模型并行长样本探针
+
+单进程、`device_map=auto` 的四卡模型并行也已验证。完整数据前缀的 164096-token
+recall 可以完成实际 W/C 两步训练：
+
+```text
+/mnt/public/haoting/mem2w_data/lossless_mp_w_c_0927
+step 1: W, 164096 recall tokens, completed
+step 2: C, 134335 recall tokens, completed
+checkpoint-1 and checkpoint-2: present
+```
+
+为支持模型并行，chunked CE 现在会在 hidden、lm_head 和 labels 分属不同 MACA
+设备时显式搬运 target，并在正确的输出设备上合并分块 loss。最长的 212062-token
+recall 仍在 GPU3 约 54.36 GiB 已分配时需要额外 3.64 GiB，因 OOM 失败；这是一条
+明确的显存边界，不是数据或模板错误。
+
 正式全量运行前必须保留完整 context，并先读取 `preflight_full_0927.json`：
 
 ```bash
