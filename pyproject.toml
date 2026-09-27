@@ -24,6 +24,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 mem2w-export = "mem2w.teacher_export:main"
 mem2w-build-data = "mem2w.build_datasets:main"
 mem2w-import-automationbench = "mem2w.raw_automationbench:main"
+mem2w-convert-automationbench-0916 = "mem2w.automationbench_0916:main"
 mem2w-train = "mem2w.train:main"
 mem2w-sft = "mem2w.ms_swift_adapter:main"
 mem2w-sft-train = "mem2w.ms_swift_train:main"

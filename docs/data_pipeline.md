@@ -67,11 +67,52 @@ mem2w-sft convert \
 `partial_credit`、`partial_credit_diagnostic`、`q_value`、`q_visits`、retrieved IDs
 和诊断信息保留为审计列，不进入 prompt，也不改变 loss。
 
-对 0916 归档真实回放的结果是：960 个 action episode，864 个发生过检索，27 个
-有完整 actor-prompt recall payload，837 个检索 episode 缺 payload，最终生成
-`action_train.jsonl=960`、`recall_train.jsonl=27`。默认 exact 模式下 27 条 payload
-中有超长样本（首条约 585k 字符），所以实际 SFT 前必须选择新的 compact 导出或显式
-启用带审计 hash 的 compaction；不能让 `max_length` 静默截断。
+如果只把公开结果目录和抽样 actor prompt 交给通用 importer，它只能得到 960 条
+episode-level action、27 条可逐字验证的 recall；这不是 0916 的正式全量训练导出。
+正式全量导出必须使用下面的归档专用转换器，从完整 trajectory 和 frozen snapshot
+恢复 6804 条单步 action 与 864 条 retrieval-event recall。
+
+## 0916 归档的正式 Mem2W 样本
+
+`0916_memrl_96+24_ds0731` 的结果目录经过归档，完整文件位置由其
+`ARCHIVED.json` 指向：
+
+```text
+result_root  = /mnt/public/haoting/mrl-textgrad/results/automationbench/0916_memrl_96+24_ds0731
+archive_root = /mnt/public/code/haoting/mrl-textgrad-archive/0916_memrl_96+24_ds0731
+```
+
+这里使用专用转换器，而不是通用的 episode importer：
+
+```bash
+mem2w-convert-automationbench-0916 \
+  --result-root /mnt/public/haoting/mrl-textgrad/results/automationbench/0916_memrl_96+24_ds0731 \
+  --archive-root /mnt/public/code/haoting/mrl-textgrad-archive/0916_memrl_96+24_ds0731 \
+  --output-dir /mnt/public/haoting/mem2w_data/automationbench_0916 \
+  --payload-budget-chars 12000 \
+  --action-context-budget-chars 16000
+```
+
+该转换器的两个输出流与 native paired trainer 对应：
+
+```text
+action_train.jsonl   # W_action_single_step：6804 条，每个 assistant action 一条
+recall_train.jsonl   # C_memory_reconstruction：864 条，每个真实 retrieval event 一条
+qa.json
+manifest.json
+```
+
+W 样本使用完整 trajectory 的可见前缀；历史 assistant/tool response 只作为条件，
+当前 assistant action 是唯一 `loss=true` 的消息。C 样本使用
+`checkpoints/snapshot/(epoch-1)/payloads.json`，按 trajectory 中
+`retrieval_records` 的顺序重建真实 `[Reference Memories]` / `[MEMRL MEMORY n]`
+上下文。该映射在归档的 27 条 actor prompt 抽样上逐字 hash 校验为 27/27；ID、相似度
+和 Q 值只保留为审计字段。
+
+由于原始 W 前缀和 C payload 很长，转换器对历史上下文和 recall target 采用显式头尾
+压缩，并保留 `context_original_chars`、`payload_original_chars`、`payload_sha256`、
+`*_compacted` 等字段。这样 ms-swift 不会静默截断；如果要做 exact teacher-payload
+复现实验，应把预算提高并单独处理超长样本，而不是直接使用默认 `max_length`。
 
 ## 质量门
 
