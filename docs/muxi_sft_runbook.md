@@ -115,6 +115,17 @@ export PYTHONPATH=/mnt/public/haoting/venvs/mem2w-smoke/lib/python3.10/site-pack
 提高吞吐并让不同样本分布到不同卡，但不会把一个 212k-token 样本自动切到多张卡；
 最长无损样本仍需要 sequence parallel 或模型/激活切分才能解决单样本 OOM。
 
+2 卡 DDP 的短无损 paired smoke 也已通过（W/C 各两步、四个 Mem2W 参数均有梯度、
+checkpoint 可写出），结果目录为 `/mnt/public/haoting/mem2w_data/lossless_ddp2_0927`。
+但是对 canonical 长样本，2 卡 `model_parallel` 在首个约 164k-token 样本的反向重算阶段
+于 GPU1 OOM（已分配约 47.94 GiB，reserved 约 14.37 GiB，还需 2.51 GiB）。因此
+2 卡可用于短/中等样本 DDP smoke，不可把当前 2 卡 profile 视为长样本稳定训练方案。
+
+本轮还探测了 `SEQUENCE_PARALLEL_SIZE=2`：212062-token 样本完成了双 rank 初始化和
+前向/反向，但 Mem2W 梯度为 non-finite；约 164k-token canonical 样本则停在首次
+Inductor/MACA kernel 编译，尚未得到 `step_completed`。sequence-parallel 仍是实验入口，
+暂不作为稳定训练 profile。
+
 ## 四卡模型并行长样本探针
 
 单进程、`device_map=auto` 的四卡模型并行也已验证。完整数据前缀的 164096-token
