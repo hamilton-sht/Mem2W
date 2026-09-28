@@ -27,6 +27,25 @@ tokens；这代表模型上下文合法，不代表在单张 64-GiB 卡上已经
 
 ## 已完成的 Muxi smoke
 
+## 直接脚本启动（推荐）
+
+启动器位于 [scripts/run_muxi_mem2w_sft.sh](/Users/haoting/Documents/ChatGPT/Mem2W/scripts/run_muxi_mem2w_sft.sh)。它会在启动前校验模型、两个 JSONL、无损预检报告和 source SHA256，并创建输出目录锁；运行中写入 `launcher.log`、`launcher_status.json`、checkpoint 和训练摘要。预检或设备放置不匹配会直接失败，不会截断、压缩或静默跳过样本。
+
+远端同步后可直接运行：
+
+```bash
+source /mnt/public/haoting/venvs/mem2w-smoke/bin/activate
+cd /mnt/public/haoting/ms-swift-mem2w
+MODE=model_parallel MAX_STEPS=2 \
+  /mnt/public/haoting/ms-swift-mem2w/scripts/run_muxi_mem2w_sft.sh
+```
+
+`model_parallel` 是当前已验证的稳定路径：一个进程使用 `device_map=auto` 跨 4 张 C500，保留完整上下文；首次运行可能触发 MACA kernel 编译。若需四进程数据并行，可设置 `MODE=data_parallel`，但单卡长上下文受限。`SEQUENCE_PARALLEL_SIZE=4` 已接入实验入口，但仍需单独完成 Muxi kernel 编译后的完整验证，暂不作为默认 profile。
+
+2026-09-28 直接脚本 smoke 已完成：全量 canonical 数据中的一条真实 recall 行（164096 tokens）完成 1 个 paired step，loss_action=0.6074、loss_recall=1.1843、峰值显存 43.8 GB，4 个 Mem2W 参数均被保存；首步耗时 221.6 秒（包含首次 kernel 编译）。
+
+当前已知边界：canonical 数据最长 recall 行为 212062 tokens。普通 4 卡 model-parallel 在该行的反向峰值仍会尝试额外分配 3.64 GiB 而 OOM；因此不能宣称“6804+864 全量、最长行全部训练完成”。这不是静默截断：启动器会保留失败现场并标记 `status=failed`。要覆盖该行，需要完成 sequence-parallel Muxi profile 或更低层的 Qwen3.5 长序列 kernel 优化。
+
 使用真实的无损数据行（不是压缩副本）完成了 2 个 paired logical steps：
 
 ```text
