@@ -226,9 +226,10 @@ def build_recall_samples(episode: Mapping[str, Any], system_prompt: str) -> list
             Message(
                 role="user",
                 content=(
-                    f"当前检索查询：\n{event['query_text']}\n\n"
-                    f"请从内部记忆中召回与该查询相关的至多 {event['k_requested']} 条历史经验。"
-                    "\n按规定的记忆格式输出；没有相关记忆时输出空列表。"
+                    f"Retrieval query:\n{event['query_text']}\n\n"
+                    f"Recall up to {event['k_requested']} relevant historical experiences from internal memory."
+                    "\nOutput them in the required memory format; if no relevant memories are available, "
+                    "output an empty list."
                 ),
             ),
         )

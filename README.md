@@ -44,6 +44,21 @@ mem2w-sft-train --mode recall \
   --output-dir artifacts/memory_recall
 ```
 
+LiveCodeBench 的单轮 execution 记录也可先转换为当前 AutomationBench/Mem2W episode
+协议：
+
+```bash
+mem2w-convert-lcb-automationbench \
+  --problems /path/to/release_v6_test6.jsonl \
+  --run-root /path/to/lcb_run \
+  --split-manifest /path/to/lcb_split.json \
+  --output-dir data/lcb_automationbench \
+  --epochs 10
+```
+
+`--epochs` 可限制转换范围；省略时转换全部 epoch，`--epochs 10` 表示只保留最后一个
+训练 epoch 及其对应验证集。
+
 两个命令都会通过 ms-swift 加载模型、processor、chat template 和 Trainer；Mem2W 在 Trainer 建立前插入第 16 个 block 后，冻结原模型并只把四个 memory 参数交给 optimizer。训练结束后输出：
 
 ```text
@@ -63,7 +78,7 @@ python swift/cli/main.py mem2w-sft \
   --warmup-fraction 0.20
 ```
 
-该入口在一个逻辑更新内完成 action/recall 两次 forward/backward 和一次 optimizer step；W 阶段两个分支更新四个参数，C 阶段 recall 分支 detach `V/W_O`，保留 `W_Q/K` 梯度。每步 checkpoint 可用 `--resume-from-checkpoint` 恢复。
+该入口按显式的 W/C 阶段运行：W 阶段只计算 action，C 阶段只计算 recall；因此不会把 recall 数据循环配对到每个 action update，也不会在一个 update 中保留 16 个长上下文计算图。C 阶段按约束分支 detach `V/W_O`，保留 `W_Q/K` 的读路径梯度。阶段边界由 native Trainer callback 保存，checkpoint 可用 `--resume-from-checkpoint` 恢复。
 
 ## 关键约束
 

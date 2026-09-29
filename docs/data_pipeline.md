@@ -7,6 +7,35 @@ Mem2W 的 canonical episode，再交给 `ms_swift_adapter` 生成 action/recall 
 
 ## 原始导入
 
+### LiveCodeBench 迁移
+
+LiveCodeBench 的 `executions.jsonl` 是单轮代码生成记录，不包含
+AutomationBench 的多轮工具消息。可以用专用转换器把它变成同一套协议；转换器同时
+写出 AutomationBench 兼容的 `trajectories.jsonl` 和 Mem2W canonical
+`episodes.jsonl`：
+
+```bash
+mem2w-convert-lcb-automationbench \
+  --problems /path/to/release_v6_test6.jsonl \
+  --run-root /path/to/exp_lcb_memrl_tg_... \
+  --split-manifest /path/to/livecodebench_release_v6_140x35_seed42.json \
+  --output-dir data/lcb_automationbench_current \
+  --epochs 10
+```
+
+`--epochs` 可选；省略时转换全部 epoch，`--epochs 10` 选择最后的稳定训练快照及其对应
+验证集。
+
+每个 LCB setting 作为一个独立 episode，代码生成被保存为
+`system → user → assistant` 的单轮 trajectory；训练/验证 split、epoch、reward、
+测试通过数和 Q key provenance 都保留。LCB actor 实际收到的 Composer guidance 可以由
+execution record 无损重建，因此它既作为带 `teacher_memory` metadata 的 user message
+保留在 canonical episode 中，也作为 retrieval event 的 exact
+`injected_context_text`。下游 action 转换按结构移除 guidance，recall 转换监督这段
+精确文本；如果某条记录缺 guidance，才标记 `recall_missing_payload=true` 并跳过该条
+recall。题目的 private test cases 不会复制到输出。验证集执行记录默认一并转换；它们
+不会创建训练 recall event。
+
 ```bash
 mem2w-import-automationbench \
   --trajectories /path/to/epochs \
@@ -118,6 +147,7 @@ W 样本使用完整 trajectory 的可见前缀；历史 assistant/tool response
 
 1. `qa.json` 中 rejected、split、join 和 `recall_missing_payload` 数量符合预期；
 2. 每个 action 行有 assistant/tool action，且 prompt 中不含 teacher payload；
-3. recall 行的 `payload_sha256` 与 actor prompt 原文一致；
+3. 0916 专用 recall 行的 `payload_sha256` 与去除 evaluator-only wrapper 后的 actor memory
+   正文一致；
 4. 没有把 `retrieval_records` 或空字符串猜成 recall 目标；
 5. `manifest.json` 的输入 hash、snapshot ID、模型/模板 manifest 被一并归档。
