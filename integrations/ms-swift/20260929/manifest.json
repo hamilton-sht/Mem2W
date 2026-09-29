@@ -1,0 +1,224 @@
+{
+  "captured_at_utc": "2026-09-29T15:42:31.455768+00:00",
+  "upstream": "https://github.com/modelscope/ms-swift",
+  "base_commit": "c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c",
+  "source": "A800 /home/sht/haoting/ms-swift-mem2w (disk snapshot; not a Git repository)",
+  "runtime_caveat": "Disk snapshot is not proof of source already imported by running processes.",
+  "files": [
+    {
+      "path": "docs/source/Customization/Mem2W.md",
+      "status": "A",
+      "bytes": 1314,
+      "sha256": "84fd4a8987525dda5afbb6eaf14eb1f89c82044b65a1b0daf987c20abb5d0597",
+      "upstream_sha256": null
+    },
+    {
+      "path": "scripts/mem2w_dist_probe.py",
+      "status": "A",
+      "bytes": 2077,
+      "sha256": "681c8287bf8daae3a561c8647595bfee30161a03d1b85e7e734f172dc5cd8822",
+      "upstream_sha256": null
+    },
+    {
+      "path": "scripts/mem2w_gradient_routing_smoke.py",
+      "status": "A",
+      "bytes": 1331,
+      "sha256": "a3e7b15e4aaca9f763bb294d02b334ed62b650b6c8bfa14531f0303275fcc01b",
+      "upstream_sha256": null
+    },
+    {
+      "path": "scripts/mem2w_lossless_preflight.py",
+      "status": "A",
+      "bytes": 3936,
+      "sha256": "cc654380a3ce610e04256f867a0108ab0c0c3b7c9a501552b42a54b3762b9ec1",
+      "upstream_sha256": null
+    },
+    {
+      "path": "scripts/mem2w_maca_probe.py",
+      "status": "A",
+      "bytes": 852,
+      "sha256": "c8d25b04a5ae83ccfdd78ef1e9a84cb2c9d2f476e446a5a88cbcc86e57ae057b",
+      "upstream_sha256": null
+    },
+    {
+      "path": "scripts/mem2w_qwen_smoke.py",
+      "status": "A",
+      "bytes": 4775,
+      "sha256": "e632c8eb2df37ba3a91fd50ac8cf184a6a913ada671d9757a64c834ad2855754",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/arguments/base_args/base_args.py",
+      "status": "M",
+      "bytes": 19071,
+      "sha256": "7c92c40c6fe67912753e6d62057a05cd0ac74a4844b0aa2cf7e6a83b1d3ed192",
+      "upstream_sha256": "b002a504d5052cb32612d2cb79baa29faf08d63781fd8633486c80d08bc50545"
+    },
+    {
+      "path": "swift/arguments/sft_args.py",
+      "status": "M",
+      "bytes": 23445,
+      "sha256": "580a9f32e915753a6a77c737142c45dd33b22b9ad41a9c27cb29dcf048d02c91",
+      "upstream_sha256": "93e01284e6a550a2103df54811a0d335fdea8292ef1e8bff341dc12dc929d769"
+    },
+    {
+      "path": "swift/arguments/tuner_args.py",
+      "status": "M",
+      "bytes": 11739,
+      "sha256": "4c24048938abab63e561c69dd63da4cf43d4bff97634affe5214864dfb25cf31",
+      "upstream_sha256": "e14e8c9928b1199efaf1a05e1cf44d1d77b7b2f472fcdf3f4a229cca2d1c2cc9"
+    },
+    {
+      "path": "swift/cli/main.py",
+      "status": "M",
+      "bytes": 3304,
+      "sha256": "c6179bf1477f65216cdbca75187facb314acbe5457e9f478a8c2fd6e3b314b5d",
+      "upstream_sha256": "d84a44f9911c01c9af83db19baf2068ad39a8ec926f6e2c58f6f69779bfdad68"
+    },
+    {
+      "path": "swift/cli/mem2w_sft.py",
+      "status": "A",
+      "bytes": 16112,
+      "sha256": "804943fc7ad3c7e5dab8ae691f866c7db155fc409fb853ec622e26e424a2e0f4",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/mem2w/__init__.py",
+      "status": "A",
+      "bytes": 435,
+      "sha256": "684f54ac70504103b4a2983b4d7c5a53722e2b4480e53593cb68e60c3cf51ab9",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/mem2w/config.py",
+      "status": "A",
+      "bytes": 2644,
+      "sha256": "e5fd0325f3179d81332299290c5451bb6165c6012f71e51fae746f19230d07e3",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/mem2w/dual_trainer.py",
+      "status": "A",
+      "bytes": 19438,
+      "sha256": "ba2f0157f8776dbfe2d914e73a4956676a2c08e8209bddf80a7dc4b9c2a8e3db",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/mem2w/integration.py",
+      "status": "A",
+      "bytes": 8552,
+      "sha256": "7dea252392fde70d42fba9ae21cfbacea534dfbe9ee6e0e53700901cee5b5203",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/mem2w/memory.py",
+      "status": "A",
+      "bytes": 4587,
+      "sha256": "92f6ed9dcf8dc9a26160359b56bf21f5e60b0f846e8d2f273c570f1f8e8c83e5",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/model/models/qwen.py",
+      "status": "M",
+      "bytes": 123092,
+      "sha256": "d3bdc2495ea93c6dee96e72ea1c46287140484eae2fa229863b00b00cf9104d4",
+      "upstream_sha256": "1dbbc8e70b098a4713ad1b3f700afd44b4aae38731c1115e9ebfa309724cf7a6"
+    },
+    {
+      "path": "swift/pipelines/train/sft.py",
+      "status": "M",
+      "bytes": 21139,
+      "sha256": "629cbd9e9ac20055b5cae7626cf1ce94511e44426d7fafc105be605c0c99a1ac",
+      "upstream_sha256": "744ceb388ae51f3f50f95f9ceb208980696ba95eaa1f01aaabb0584bd78515b6"
+    },
+    {
+      "path": "swift/trainers/__init__.py",
+      "status": "M",
+      "bytes": 1582,
+      "sha256": "99e7e8d69e5cc748256de9585d6a17da761b46c656cc28e31caa045afbf1897c",
+      "upstream_sha256": "576dd0bed73d14e7c6f122cd569900abeb94781977f971fa5203aabd6f56695a"
+    },
+    {
+      "path": "swift/trainers/mem2w_trainer.py",
+      "status": "A",
+      "bytes": 14126,
+      "sha256": "b6f33dfda2143b099847819d0300d374729300f68a8a30a7bef9d626c6a8f7fe",
+      "upstream_sha256": null
+    },
+    {
+      "path": "swift/trainers/mixin.py",
+      "status": "M",
+      "bytes": 75047,
+      "sha256": "e256f9d1cf422451673cacc04c3c508bd5b71ab68b2658bb2ec232c056ed9b05",
+      "upstream_sha256": "5db946649ceeec1cd0bf4fb0a90008d34da952efb20c304040926d7a913d57a2"
+    },
+    {
+      "path": "swift/trainers/seq2seq_trainer.py",
+      "status": "M",
+      "bytes": 18310,
+      "sha256": "9d261417e71d294ad77611a539495fe2197726fc8df935a882acba1db1f94fba",
+      "upstream_sha256": "4bb65c60321cd619dd44a530e1b228ce470c625a9134666758c21d1337f79163"
+    },
+    {
+      "path": "swift/trainers/trainer_factory.py",
+      "status": "M",
+      "bytes": 2812,
+      "sha256": "1bdbf45ee473ec9ea8757939d9ba48dbe8ba16f72dea57e85ed3fd1afe5abe97",
+      "upstream_sha256": "a1cbf30ee4e88e9f5cb95ac9a47ecf5836c526f5305455547966363c7ef45f32"
+    },
+    {
+      "path": "swift/tuner_plugin/__init__.py",
+      "status": "M",
+      "bytes": 774,
+      "sha256": "4e9be2b6d043e6ba1b42ddf526e0e2fcb84142ab2677a03bfb5f61dfd1204af9",
+      "upstream_sha256": "82760a92bee3ded57051ae3077ec594be9856317c85243036e40ef4fc37d1a1a"
+    },
+    {
+      "path": "swift/tuner_plugin/mapping.py",
+      "status": "M",
+      "bytes": 314,
+      "sha256": "82f417706e8be0bb2a859e6bb142af500010236a32da863ca8fa075de8e583fc",
+      "upstream_sha256": "2f7ee423bc5e50192098347ae416a24e59dbb1d3a7002d8abe2cfe9aa149f593"
+    },
+    {
+      "path": "swift/tuners/mem2w.py",
+      "status": "A",
+      "bytes": 6760,
+      "sha256": "ca767ac0fb7d1de4b1c454aa9f9dd1350e1962f79efdff75f0dd35646b1700d0",
+      "upstream_sha256": null
+    },
+    {
+      "path": "tests/test_mem2w_chunked_loss.py",
+      "status": "A",
+      "bytes": 1122,
+      "sha256": "3b7e1f50752128c342cefdf6e9f983312e7b4215e6e1132fbb60d81411dd56ab",
+      "upstream_sha256": null
+    },
+    {
+      "path": "tests/test_mem2w_memory_tiling.py",
+      "status": "A",
+      "bytes": 1529,
+      "sha256": "d7c88c0b611c22e57bbce0f81420e92b2bb5786427caff62c4fe08978c3bac6f",
+      "upstream_sha256": null
+    },
+    {
+      "path": "tests/test_mem2w_native.py",
+      "status": "A",
+      "bytes": 1413,
+      "sha256": "18e65d1ab62e7bb3de97b5ee51a582ff3cb3adf7b0962acb66d6f1f62d616bc1",
+      "upstream_sha256": null
+    }
+  ],
+  "excluded": [
+    {
+      "path": "swift/model/models/qwen.py.bak_20260929_chunk",
+      "reason": "timestamped backup, not active source",
+      "sha256": "18bab7e7686986b4473c205f6d57bf5d61b4b5c46d98204f7be83c545c90c534"
+    },
+    {
+      "path": "swift/model/models/qwen.py.bak_20260929_fla",
+      "reason": "timestamped backup, not active source",
+      "sha256": "1dbbc8e70b098a4713ad1b3f700afd44b4aae38731c1115e9ebfa309724cf7a6"
+    }
+  ]
+}

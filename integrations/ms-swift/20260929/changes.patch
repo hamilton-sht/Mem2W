@@ -1,0 +1,2576 @@
+diff --git a/docs/source/Customization/Mem2W.md b/docs/source/Customization/Mem2W.md
+new file mode 100644
+--- /dev/null
++++ b/docs/source/Customization/Mem2W.md
+@@ -0,0 +1,31 @@
++# Native Mem2W SFT
++
++This checkout contains an opt-in native Mem2W path. It is implemented inside
++the ms-swift SFT pipeline rather than through an external plugin or a second
++Trainer implementation.
++
++## Enable the model extension
++
++```bash
++swift sft \
++  --model Qwen/Qwen3.5-9B \
++  --template qwen3_5 \
++  --tuner_type mem2w \
++  --dataset /path/to/action_train.jsonl \
++  --output_dir output/mem2w_action
++```
++
++The native `mem2w` tuner has arguments for the insertion index, slot count,
++key/value dimensions, RMSNorm epsilon and dropout. Its adapter/checkpoint path
++is compatible with ms-swift's normal `--adapters` and resume flow.
++
++The native SFT pipeline loads the model and template using the normal ms-swift
++path, then the native tuner attaches Mem2W after decoder block index 15 and
++freezes every parameter except `W_Q`, `K`, `V` and `W_O`. The original decoder
++layer is kept intact and receives a forward hook, so gradient checkpointing,
++FSDP/DeepSpeed wrapping, layer indices and state-dict ownership remain native.
++The trainer's existing tuner save path writes a memory-only checkpoint.
++
++The standard ms-swift causal-LM loss and message-level `loss` masks are used;
++no upstream Trainer or chat-template fork is needed. This first integration
++does not yet implement the later paired action/recall W/C schedule.
+diff --git a/scripts/mem2w_dist_probe.py b/scripts/mem2w_dist_probe.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mem2w_dist_probe.py
+@@ -0,0 +1,51 @@
++"""Small MACA distributed capability probe used before launching DDP smoke tests."""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import torch
++import torch.distributed as dist
++
++
++def main() -> None:
++    report = {
++        'torch': torch.__version__,
++        'cuda_device_count': torch.cuda.device_count(),
++        'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
++        'distributed': dist.is_available(),
++        'gloo': dist.is_gloo_available(),
++        'nccl': dist.is_nccl_available(),
++        'mpi': dist.is_mpi_available() if hasattr(dist, 'is_mpi_available') else False,
++        'rank': int(os.getenv('RANK', '-1')),
++        'world_size': int(os.getenv('WORLD_SIZE', '-1')),
++    }
++    if int(os.getenv('WORLD_SIZE', '1')) > 1:
++        backend = os.getenv('MEM2W_DIST_BACKEND', 'gloo')
++        try:
++            dist.init_process_group(backend=backend)
++            rank = dist.get_rank()
++            device = torch.device('cuda', int(os.getenv('LOCAL_RANK', '0')))
++            value = torch.tensor([rank + 1], device=device, dtype=torch.float32)
++            dist.all_reduce(value)
++            report.update({
++                'backend': backend,
++                'rank': rank,
++                'world_size': dist.get_world_size(),
++                'local_rank': int(os.getenv('LOCAL_RANK', '0')),
++                'all_reduce_value': float(value.item()),
++                'all_reduce_expected': sum(range(1, dist.get_world_size() + 1)),
++            })
++            dist.destroy_process_group()
++        except Exception as exc:  # pragma: no cover - hardware/runtime dependent
++            report.update({'backend': backend, 'error': f'{type(exc).__name__}: {exc}'})
++    default_output = f"/tmp/mem2w_dist_probe_rank{report['rank']}.json"
++    output = Path(os.getenv('MEM2W_DIST_PROBE_OUTPUT', default_output))
++    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
++    print(json.dumps(report, ensure_ascii=False), flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/mem2w_gradient_routing_smoke.py b/scripts/mem2w_gradient_routing_smoke.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mem2w_gradient_routing_smoke.py
+@@ -0,0 +1,32 @@
++"""GPU/CPU-independent check for the Mem2W W/C content-gradient rule."""
++
++import torch
++
++from swift.mem2w import Mem2WConfig
++from swift.mem2w.memory import PersistentKVMemory
++
++
++def main() -> None:
++    torch.manual_seed(7)
++    memory = PersistentKVMemory(Mem2WConfig(hidden_size=32, slots=8, key_dim=8, value_dim=8))
++    with torch.no_grad():
++        memory.W_O.normal_(std=0.1)
++    hidden = torch.randn(2, 5, 32)
++
++    warmup_loss = memory(hidden, stop_content_grad=False).float().square().mean()
++    warmup_loss.backward()
++    warmup = {name: parameter.grad is not None for name, parameter in memory.named_parameters()}
++    if set(name for name, present in warmup.items() if present) != {'W_Q', 'K', 'V', 'W_O'}:
++        raise AssertionError(f'W stage gradient set mismatch: {warmup}')
++
++    memory.zero_grad(set_to_none=True)
++    constrained_loss = memory(hidden, stop_content_grad=True).float().square().mean()
++    constrained_loss.backward()
++    constrained = {name: parameter.grad is not None for name, parameter in memory.named_parameters()}
++    if constrained != {'W_Q': True, 'K': True, 'V': False, 'W_O': False}:
++        raise AssertionError(f'C stage gradient set mismatch: {constrained}')
++    print({'status': 'ok', 'warmup_gradients': warmup, 'constrained_gradients': constrained})
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/mem2w_lossless_preflight.py b/scripts/mem2w_lossless_preflight.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mem2w_lossless_preflight.py
+@@ -0,0 +1,74 @@
++"""Audit EVERY lossless row using native SWIFT encoding, without model weights."""
++import argparse
++import copy
++import hashlib
++import json
++from pathlib import Path
++
++from swift import get_processor, get_template
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--model', required=True)
++    parser.add_argument('--data-dir', required=True, type=Path)
++    parser.add_argument('--report', required=True, type=Path)
++    args = parser.parse_args()
++    config = json.loads((Path(args.model) / 'config.json').read_text())
++    limit = config.get('text_config', config)['max_position_embeddings']
++    processor = get_processor(args.model, download_model=False)
++    template = get_template(processor, template_type='qwen3_5', max_length=None,
++                            truncation_strategy='raise', remove_unused_columns=False,
++                            loss_scale='default', is_binary_loss_scale=True, enable_thinking=False)
++    template.set_mode('train')
++    report = {'model': args.model, 'model_context_limit': limit, 'streams': {}}
++    for kind in ('action', 'recall'):
++        path = args.data_dir / f'{kind}_train.jsonl'
++        records, errors = [], []
++        digest = hashlib.sha256()
++        with path.open('rb') as stream:
++            for i, raw in enumerate(stream, 1):
++                digest.update(raw)
++                row = json.loads(raw)
++                try:
++                    original = copy.deepcopy(row)
++                    encoded = template.encode(row)
++                    if isinstance(encoded, (list, tuple)):
++                        raise ValueError('unexpected split')
++                    ids, labels = encoded['input_ids'], encoded['labels']
++                    count = sum(label != -100 for label in labels[1:])
++                    if not count:
++                        raise ValueError('zero supervised tokens')
++                    if kind == 'recall':
++                        target = original['messages'][-1]['content']
++                        if hashlib.sha256(target.encode()).hexdigest() != original['payload_sha256']:
++                            raise ValueError('recall target hash mismatch')
++                    # Prove the per-message loss flag reaches the native encoder.
++                    if i <= 3:
++                        disabled = copy.deepcopy(original)
++                        for message in disabled['messages']:
++                            message['loss'] = False
++                        masked = template.encode(disabled)
++                        if sum(x != -100 for x in masked['labels'][1:]) > 2:
++                            raise ValueError('loss-mask leak when every message is disabled')
++                    records.append({'row': i, 'sample_id': original['sample_id'],
++                                    'tokens': len(ids), 'supervised_tokens': count})
++                except Exception as exc:
++                    errors.append({'row': i, 'error': repr(exc)})
++                if i % 128 == 0:
++                    print(json.dumps({'stream': kind, 'processed': i, 'errors': len(errors)}), flush=True)
++        lengths = sorted(r['tokens'] for r in records)
++        summary = {'rows': len(records), 'errors': errors, 'source_sha256': digest.hexdigest(),
++                   'min': min(lengths), 'max': max(lengths),
++                   'p50': lengths[len(lengths) // 2], 'p95': lengths[int(len(lengths) * .95)],
++                   'overflow': [r for r in records if r['tokens'] > limit],
++                   'total_tokens': sum(lengths), 'records': records}
++        report['streams'][kind] = summary
++        print(json.dumps({kind: {k: v for k, v in summary.items() if k != 'records'}}), flush=True)
++    report['ok'] = all(not value['errors'] and not value['overflow'] for value in report['streams'].values())
++    args.report.write_text(json.dumps(report, indent=2) + '\n')
++    raise SystemExit(0 if report['ok'] else 1)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/mem2w_maca_probe.py b/scripts/mem2w_maca_probe.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mem2w_maca_probe.py
+@@ -0,0 +1,17 @@
++"""Probe native MACA FlashAttention forward/backward before long-sequence SFT."""
++import json
++import torch
++import flash_attn
++from flash_attn import flash_attn_func
++
++torch.manual_seed(42)
++q = torch.randn(1, 128, 16, 256, device='cuda', dtype=torch.bfloat16, requires_grad=True)
++k = torch.randn(1, 128, 4, 256, device='cuda', dtype=torch.bfloat16, requires_grad=True)
++v = torch.randn_like(k, requires_grad=True)
++out = flash_attn_func(q, k, v, causal=True)
++out.float().square().mean().backward()
++torch.cuda.synchronize()
++assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q, k, v))
++print(json.dumps({'torch': torch.__version__, 'flash_attn': flash_attn.__version__,
++                  'device': torch.cuda.get_device_name(), 'flash_backward': 'passed',
++                  'peak_bytes': torch.cuda.max_memory_allocated()}), flush=True)
+diff --git a/scripts/mem2w_qwen_smoke.py b/scripts/mem2w_qwen_smoke.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mem2w_qwen_smoke.py
+@@ -0,0 +1,130 @@
++"""Run a small native Mem2W smoke test against a local Qwen3.5 checkpoint.
++
++This intentionally exercises the same native tuner entry point used by
++``swift sft --tuner_type mem2w`` while keeping the sequence and memory adapter
++small enough for a single Muxi C500.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from types import SimpleNamespace
++from collections.abc import Mapping
++
++import torch
++from transformers import AutoModelForImageTextToText, AutoTokenizer
++
++from swift.tuners.mem2w import Mem2WTuner
++
++
++def _args(insertion_index: int, slots: int, key_dim: int, value_dim: int):
++    return SimpleNamespace(
++        mem2w_insertion_index=insertion_index,
++        mem2w_slots=slots,
++        mem2w_key_dim=key_dim,
++        mem2w_value_dim=value_dim,
++        mem2w_rms_eps=1e-6,
++        mem2w_dropout=0.0,
++        mem2w_stop_content_grad=False,
++    )
++
++
++def _trainable(model):
++    return [(name, param) for name, param in model.named_parameters() if param.requires_grad]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--model', required=True)
++    parser.add_argument('--output', required=True)
++    parser.add_argument('--insertion-index', type=int, default=15)
++    parser.add_argument('--slots', type=int, default=16)
++    parser.add_argument('--key-dim', type=int, default=32)
++    parser.add_argument('--value-dim', type=int, default=32)
++    args = parser.parse_args()
++
++    if not torch.cuda.is_available():
++        raise RuntimeError('MUSA/CUDA device is not available')
++    device = torch.device('cuda:0')
++    dtype = torch.bfloat16
++
++    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
++    model = AutoModelForImageTextToText.from_pretrained(
++        args.model,
++        torch_dtype=dtype,
++        low_cpu_mem_usage=True,
++        local_files_only=True,
++    ).to(device)
++    model.eval()
++    print(json.dumps({
++        'model_type': getattr(model.config, 'model_type', None),
++        'class': type(model).__name__,
++        'device': str(next(model.parameters()).device),
++        'dtype': str(next(model.parameters()).dtype),
++        'layers': len(getattr(getattr(getattr(model, 'model', None), 'language_model', None), 'layers', [])),
++    }, ensure_ascii=False))
++
++    messages = [
++        {'role': 'user', 'content': 'Remember that the deployment target is a Muxi C500 GPU.'},
++        {'role': 'assistant', 'content': 'I will retain that deployment constraint.'},
++    ]
++    rendered = tokenizer.apply_chat_template(
++        messages,
++        tokenize=True,
++        add_generation_prompt=False,
++        enable_thinking=False,
++        return_tensors='pt',
++    )
++    input_ids = rendered['input_ids'] if isinstance(rendered, Mapping) else rendered
++    attention_mask = rendered.get('attention_mask') if isinstance(rendered, Mapping) else None
++    input_ids = input_ids.to(device)
++    if attention_mask is None:
++        attention_mask = torch.ones_like(input_ids, device=device)
++    else:
++        attention_mask = attention_mask.to(device)
++
++    model = Mem2WTuner.prepare_model(
++        _args(args.insertion_index, args.slots, args.key_dim, args.value_dim), model)
++    trainable = _trainable(model)
++    names = [name for name, _ in trainable]
++    if len(trainable) != 4 or not all(name.endswith(('W_Q', 'K', 'V', 'W_O')) for name in names):
++        raise AssertionError(f'expected four Mem2W tensors, got {names}')
++
++    labels = input_ids.clone()
++    outputs = model(
++        input_ids=input_ids,
++        attention_mask=attention_mask,
++        labels=labels,
++        use_cache=False,
++    )
++    loss = outputs.loss
++    loss.backward()
++    grads = {name: param.grad for name, param in trainable}
++    if any(grad is None or not torch.isfinite(grad).all().item() for grad in grads.values()):
++        raise AssertionError('a Mem2W parameter has no finite gradient')
++
++    output = Path(args.output)
++    output.mkdir(parents=True, exist_ok=True)
++    Mem2WTuner.save_pretrained(model, str(output))
++    before = {name: param.detach().cpu().clone() for name, param in trainable}
++    with torch.no_grad():
++        trainable[0][1].add_(1.0)
++    Mem2WTuner.from_pretrained(model, str(output), is_trainable=True)
++    after = {name: param.detach().cpu() for name, param in trainable}
++    if any(not torch.equal(before[name], after[name]) for name in before):
++        raise AssertionError('checkpoint reload did not restore Mem2W tensors')
++
++    print(json.dumps({
++        'loss': float(loss.detach().cpu()),
++        'input_tokens': int(input_ids.shape[-1]),
++        'trainable': names,
++        'checkpoint': str(output),
++        'checkpoint_files': sorted(path.name for path in output.iterdir()),
++        'status': 'ok',
++    }, ensure_ascii=False))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/swift/arguments/base_args/base_args.py b/swift/arguments/base_args/base_args.py
+--- a/swift/arguments/base_args/base_args.py
++++ b/swift/arguments/base_args/base_args.py
+@@ -290,6 +290,15 @@
+         force_load_keys = [
+             # base_args
+             'tuner_type',
++            # Mem2W tuner shape/configuration must match memory.safetensors.
++            'mem2w_insertion_index',
++            'mem2w_slots',
++            'mem2w_key_dim',
++            'mem2w_value_dim',
++            'mem2w_rms_eps',
++            'mem2w_dropout',
++            'mem2w_stop_content_grad',
++            'mem2w_compute_chunk_size',
+             # model_args
+             'task_type',
+             # quant_args
+diff --git a/swift/arguments/sft_args.py b/swift/arguments/sft_args.py
+--- a/swift/arguments/sft_args.py
++++ b/swift/arguments/sft_args.py
+@@ -180,6 +180,22 @@
+     # auto_tp
+     deepspeed_autotp_size: Optional[int] = None
+ 
++    # Mem2W paired SFT. The action dataset remains --dataset; this second
++    # path is consumed by the native paired Trainer and is never concatenated
++    # into the action stream.
++    mem2w_recall_dataset: Optional[list[str]] = None
++    mem2w_lambda_recall: float = 1.0
++    mem2w_warmup_fraction: float = 0.20
++    mem2w_stage_plan: Optional[str] = None
++    mem2w_accumulation_steps: int = 8
++    mem2w_loss_chunk_size: int = 0
++    mem2w_activation_offload: bool = False
++
++    # Generic hidden-state + lm_head chunked CE for long-context SFT.  This
++    # avoids materializing [batch, sequence, vocab] logits for ordinary LoRA
++    # or full-parameter training while preserving every supervised token.
++    sft_loss_chunk_size: int = 0
++
+     # fsdp
+     fsdp: Optional[str] = None
+ 
+@@ -208,6 +224,17 @@
+         BaseArguments.__post_init__(self)
+         self._init_override()
+         TunerArguments.__post_init__(self)
++        if self.tuner_type == 'mem2w':
++            if not self.mem2w_recall_dataset:
++                raise ValueError('Mem2W requires --mem2w_recall_dataset')
++            if self.mem2w_accumulation_steps <= 0:
++                raise ValueError('mem2w_accumulation_steps must be positive')
++            if self.mem2w_lambda_recall < 0:
++                raise ValueError('mem2w_lambda_recall must be non-negative')
++            # The native paired dataset groups this many microbatches into one
++            # Trainer example, so the outer Trainer performs one optimizer
++            # update per logical Mem2W W/C update.
++            self.gradient_accumulation_steps = 1
+         self._check_padding_free()
+         if self.vit_gradient_checkpointing is None:
+             self.vit_gradient_checkpointing = self.gradient_checkpointing
+diff --git a/swift/arguments/tuner_args.py b/swift/arguments/tuner_args.py
+--- a/swift/arguments/tuner_args.py
++++ b/swift/arguments/tuner_args.py
+@@ -129,6 +129,16 @@
+     # e.g. ['wte', 'ln_1', 'ln_2', 'ln_f', 'lm_head']
+     modules_to_save: List[str] = field(default_factory=list)
+ 
++    # Mem2W native tuner
++    mem2w_insertion_index: int = 15
++    mem2w_slots: int = 512
++    mem2w_key_dim: int = 256
++    mem2w_value_dim: int = 256
++    mem2w_rms_eps: float = 1e-6
++    mem2w_dropout: float = 0.0
++    mem2w_stop_content_grad: bool = False
++    mem2w_compute_chunk_size: int = 16384
++
+     # lora
+     lora_rank: int = 8
+     lora_alpha: float = 32.0
+diff --git a/swift/cli/main.py b/swift/cli/main.py
+--- a/swift/cli/main.py
++++ b/swift/cli/main.py
+@@ -14,6 +14,7 @@
+ ROUTE_MAPPING: Dict[str, str] = {
+     'pt': 'swift.cli.pt',
+     'sft': 'swift.cli.sft',
++    'mem2w-sft': 'swift.cli.mem2w_sft',
+     'infer': 'swift.cli.infer',
+     'merge-lora': 'swift.cli.merge_lora',
+     'web-ui': 'swift.cli.web_ui',
+diff --git a/swift/cli/mem2w_sft.py b/swift/cli/mem2w_sft.py
+new file mode 100644
+--- /dev/null
++++ b/swift/cli/mem2w_sft.py
+@@ -0,0 +1,327 @@
++"""Native ms-swift paired Mem2W action/recall training entry point."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++from pathlib import Path
++
++import torch
++import torch.distributed as dist
++
++from swift.arguments import SftArguments
++from swift.mem2w import get_memory_module
++from swift.mem2w.dual_trainer import Mem2WDualConfig, Mem2WDualObjectiveTrainer, read_jsonl
++from swift.tuners.mem2w import Mem2WTuner
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description='Train Mem2W with paired action/recall W/C objectives')
++    parser.add_argument('--model', required=True)
++    parser.add_argument('--action-dataset', required=True)
++    parser.add_argument('--recall-dataset', required=True)
++    parser.add_argument('--output-dir', required=True)
++    parser.add_argument('--resume-from-checkpoint')
++    parser.add_argument('--template', default='qwen3_5')
++    parser.add_argument('--max-length', type=int, default=4096)
++    parser.add_argument('--attn-impl', default=None)
++    parser.add_argument('--gradient-checkpointing', action='store_true')
++    parser.add_argument('--loss-chunk-size', type=int, default=0)
++    parser.add_argument('--lazy-encode', action='store_true')
++    parser.add_argument('--activation-offload', action='store_true',
++                        help='offload autograd-saved activations to host RAM for very long lossless rows')
++    parser.add_argument('--max-steps', type=int, default=2)
++    parser.add_argument(
++        '--stage-plan',
++        default=None,
++        help='explicit stage schedule such as W:851,C:851,W:851; overrides --max-steps',
++    )
++    parser.add_argument('--learning-rate', type=float, default=1e-4)
++    parser.add_argument('--lambda-recall', type=float, default=1.0)
++    parser.add_argument('--warmup-fraction', type=float, default=0.20)
++    parser.add_argument('--max-grad-norm', type=float, default=1.0)
++    parser.add_argument('--accumulation-steps', type=int, default=8)
++    parser.add_argument('--lr-warmup-fraction', type=float, default=0.03)
++    parser.add_argument('--seed', type=int, default=42)
++    parser.add_argument('--mem2w-insertion-index', type=int, default=15)
++    parser.add_argument('--mem2w-slots', type=int, default=512)
++    parser.add_argument('--mem2w-key-dim', type=int, default=256)
++    parser.add_argument('--mem2w-value-dim', type=int, default=256)
++    parser.add_argument('--mem2w-rms-eps', type=float, default=1e-6)
++    parser.add_argument('--mem2w-dropout', type=float, default=0.0)
++    parser.add_argument('--mem2w-stop-content-grad', action='store_true')
++    parser.add_argument('--mem2w-compute-chunk-size', type=int, default=2048)
++    parser.add_argument('--distributed-backend', default='nccl')
++    parser.add_argument('--sequence-parallel-size', type=int, default=1)
++    return parser
++
++
++def _parse_stage_plan(value: str | None) -> tuple[tuple[str, int], ...] | None:
++    if value is None:
++        return None
++    plan = []
++    for item in value.split(','):
++        stage, separator, count = item.strip().partition(':')
++        if not separator or stage not in {'W', 'C'}:
++            raise ValueError('--stage-plan entries must use W:<updates> or C:<updates>')
++        try:
++            updates = int(count)
++        except ValueError as exc:
++            raise ValueError(f'invalid stage-plan update count: {count!r}') from exc
++        if updates <= 0:
++            raise ValueError('--stage-plan update counts must be positive')
++        plan.append((stage, updates))
++    if not plan:
++        raise ValueError('--stage-plan must not be empty')
++    return tuple(plan)
++
++
++def _make_args(ns: argparse.Namespace) -> SftArguments:
++    return SftArguments(
++        model=ns.model,
++        dataset=[str(Path(ns.action_dataset).expanduser().resolve())],
++        # Keep the native SftArguments contract in sync with the paired
++        # trainer. Mem2W validation requires this path even though the
++        # custom loop reads/encodes the recall stream itself below.
++        mem2w_recall_dataset=[str(Path(ns.recall_dataset).expanduser().resolve())],
++        mem2w_lambda_recall=ns.lambda_recall,
++        mem2w_stage_plan=ns.stage_plan,
++        mem2w_accumulation_steps=ns.accumulation_steps,
++        mem2w_loss_chunk_size=ns.loss_chunk_size,
++        mem2w_activation_offload=ns.activation_offload,
++        template=ns.template,
++        tuner_type='mem2w',
++        output_dir=str(Path(ns.output_dir).expanduser().resolve()),
++        max_length=ns.max_length,
++        truncation_strategy='raise',
++        enable_thinking=False,
++        attn_impl=ns.attn_impl,
++        packing=False,
++        gradient_checkpointing=False,
++        remove_unused_columns=False,
++        sequence_parallel_size=ns.sequence_parallel_size,
++        report_to=[],
++        seed=ns.seed,
++        gradient_accumulation_steps=ns.accumulation_steps,
++        add_version=False,
++        load_args=False,
++        bf16=bool(torch.cuda.is_available()),
++        mem2w_insertion_index=ns.mem2w_insertion_index,
++        mem2w_slots=ns.mem2w_slots,
++        mem2w_key_dim=ns.mem2w_key_dim,
++        mem2w_value_dim=ns.mem2w_value_dim,
++        mem2w_rms_eps=ns.mem2w_rms_eps,
++        mem2w_dropout=ns.mem2w_dropout,
++        mem2w_stop_content_grad=ns.mem2w_stop_content_grad,
++        mem2w_compute_chunk_size=ns.mem2w_compute_chunk_size,
++    )
++
++
++def _distributed_setup(backend: str) -> tuple[int, int, int]:
++    world_size = int(os.environ.get('WORLD_SIZE', '1'))
++    rank = int(os.environ.get('RANK', '0'))
++    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
++    if world_size > 1:
++        if not torch.cuda.is_available():
++            raise RuntimeError('distributed Mem2W training requires CUDA/MACA devices')
++        torch.cuda.set_device(local_rank)
++        if not dist.is_initialized():
++            dist.init_process_group(backend=backend)
++    return rank, world_size, local_rank
++
++
++def _shard_rows(rows: list[dict], rank: int, world_size: int) -> list[dict]:
++    if world_size <= 1:
++        return rows
++    shard = rows[rank::world_size]
++    # Tiny smoke fixtures may contain one row.  Replicate that row rather than
++    # constructing an empty branch on ranks which are only testing collectives.
++    return shard or rows[:1]
++
++
++def run(ns: argparse.Namespace) -> dict:
++    rank, world_size, _local_rank = _distributed_setup(ns.distributed_backend)
++    is_main = rank == 0
++    if is_main:
++        print(json.dumps({'event': 'runtime_devices', 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
++                          'cuda_available': torch.cuda.is_available(),
++                          'cuda_device_count': torch.cuda.device_count()}), flush=True)
++    stage_plan = _parse_stage_plan(ns.stage_plan)
++    if stage_plan is None and ns.max_steps < 1:
++        raise ValueError('--max-steps must be positive')
++    total_updates = sum(updates for _stage, updates in stage_plan) if stage_plan else ns.max_steps
++    action_rows = read_jsonl(ns.action_dataset)
++    recall_rows = read_jsonl(ns.recall_dataset)
++    if not action_rows or not recall_rows:
++        raise ValueError('action and recall JSONL files must both contain at least one row')
++    if {row.get('sample_type') for row in action_rows} != {'action'}:
++        raise ValueError('action dataset contains a row whose sample_type is not action')
++    if {row.get('sample_type') for row in recall_rows} != {'recall'}:
++        raise ValueError('recall dataset contains a row whose sample_type is not recall')
++    if ns.sequence_parallel_size <= 1:
++        action_rows = _shard_rows(action_rows, rank, world_size)
++        recall_rows = _shard_rows(recall_rows, rank, world_size)
++
++    args = _make_args(ns)
++    model, processor = args.get_model_processor()
++    if is_main:
++        print(json.dumps({'event': 'model_loaded', 'first_parameter_device': str(next(model.parameters()).device),
++                          'parameter_devices': sorted({str(parameter.device) for parameter in model.parameters()})}), flush=True)
++    if ns.sequence_parallel_size > 1:
++        if world_size != ns.sequence_parallel_size:
++            raise ValueError('--sequence-parallel-size must equal WORLD_SIZE for the paired trainer')
++        from swift.sequence_parallel import sequence_parallel
++        sequence_parallel.prepare(ns.sequence_parallel_size, model=model, tokenizer=processor, padding_free=False)
++    template = args.get_template(processor)
++    template.set_mode('train')
++    template.sequence_parallel_size = ns.sequence_parallel_size
++    if getattr(template, 'use_model', False):
++        template.model = model
++    model = Mem2WTuner.prepare_model(args, model)
++    insertion_index = int(getattr(model, '_mem2w_insertion_index', -1))
++    trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
++    if insertion_index != ns.mem2w_insertion_index:
++        raise RuntimeError(
++            f'Mem2W insertion mismatch: requested {ns.mem2w_insertion_index}, got {insertion_index}')
++    if len(trainable) != 4 or not all(getattr(parameter, 'is_mem2w_parameter', False)
++                                      for _name, parameter in trainable):
++        raise RuntimeError(f'Mem2W must expose exactly four trainable tensors, got {[name for name, _ in trainable]}')
++    if is_main:
++        print(json.dumps({
++            'event': 'mem2w_trainable_scope',
++            'insertion_index_0based': insertion_index,
++            'layer_number_1based': insertion_index + 1,
++            'trainable': [name for name, _parameter in trainable],
++        }), flush=True)
++        print(json.dumps({'event': 'model_prepared', 'first_parameter_device': str(next(model.parameters()).device),
++                          'parameter_devices': sorted({str(parameter.device) for parameter in model.parameters()})}), flush=True)
++    if world_size > 1:
++        for parameter in model.parameters():
++            if getattr(parameter, 'is_mem2w_parameter', False):
++                dist.broadcast(parameter.data, src=0)
++    if ns.gradient_checkpointing:
++        # Non-reentrant recomputation retains gradients through a frozen
++        # backbone into the attached memory without requiring input gradients.
++        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
++    device = next(model.parameters()).device
++    if is_main:
++        device_map = getattr(model, 'hf_device_map', None)
++        if device_map is None:
++            device_map = getattr(getattr(model, 'model', None), 'hf_device_map', None)
++        print(json.dumps({'event': 'model_placement', 'first_parameter_device': str(device),
++                          'parameter_devices': sorted({str(parameter.device) for parameter in model.parameters()}),
++                          'device_map': device_map}, default=str), flush=True)
++    optimizer = torch.optim.AdamW(
++        [parameter for parameter in model.parameters() if parameter.requires_grad],
++        lr=ns.learning_rate,
++    )
++    warmup_steps = max(1, math.ceil(ns.lr_warmup_fraction * total_updates))
++
++    def lr_lambda(step: int) -> float:
++        if step < warmup_steps:
++            return float(step + 1) / warmup_steps
++        progress = (step - warmup_steps) / max(1, total_updates - warmup_steps)
++        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
++
++    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
++    start_step = 0
++    if ns.resume_from_checkpoint:
++        checkpoint = Path(ns.resume_from_checkpoint).expanduser().resolve()
++        Mem2WTuner.from_pretrained(model, str(checkpoint), is_trainable=True)
++        optimizer_path = checkpoint / 'optimizer.pt'
++        state_path = checkpoint / 'mem2w_dual_state.json'
++        if optimizer_path.is_file():
++            optimizer.load_state_dict(torch.load(optimizer_path, map_location='cpu', weights_only=True))
++        scheduler_path = checkpoint / 'scheduler.pt'
++        if scheduler_path.is_file():
++            scheduler.load_state_dict(torch.load(scheduler_path, map_location='cpu', weights_only=True))
++        if state_path.is_file():
++            start_step = int(json.loads(state_path.read_text(encoding='utf-8')).get('global_step', 0))
++        rng_path = checkpoint / 'rng_state.pt'
++        if rng_path.is_file():
++            rng_state = torch.load(rng_path, map_location='cpu', weights_only=True)
++            torch.set_rng_state(rng_state['cpu'])
++            if torch.cuda.is_available() and rng_state.get('cuda') is not None:
++                torch.cuda.set_rng_state_all(rng_state['cuda'])
++
++    trainer = Mem2WDualObjectiveTrainer(
++        model,
++        template,
++        action_rows,
++        recall_rows,
++        optimizer,
++        Mem2WDualConfig(
++            lambda_recall=ns.lambda_recall,
++            warmup_fraction=ns.warmup_fraction,
++            max_grad_norm=ns.max_grad_norm,
++            loss_chunk_size=ns.loss_chunk_size,
++            lazy_encode=ns.lazy_encode,
++            activation_offload=ns.activation_offload,
++            sequence_parallel_size=ns.sequence_parallel_size,
++            stage_plan=stage_plan,
++        ),
++        total_updates=total_updates,
++        scheduler=scheduler,
++        accumulation_steps=ns.accumulation_steps,
++        device=device,
++    )
++    output_dir = Path(ns.output_dir).expanduser().resolve()
++    if is_main:
++        output_dir.mkdir(parents=True, exist_ok=True)
++        run_config = {**vars(ns), 'rank': rank, 'world_size': world_size}
++        (output_dir / 'run_config.json').write_text(json.dumps(run_config, indent=2) + '\n', encoding='utf-8')
++    logs = []
++    for update_index in range(start_step + 1, total_updates + 1):
++        if is_main:
++            print(json.dumps({'event': 'step_start', 'global_step': update_index}), flush=True)
++        metrics = trainer.train_step(update_index)
++        if is_main:
++            print(json.dumps({'event': 'step_completed', 'global_step': update_index, **metrics}), flush=True)
++            logs.append(metrics)
++            checkpoint = output_dir / f'checkpoint-{update_index}'
++            Mem2WTuner.save_pretrained(model, str(checkpoint), state_dict=model.state_dict())
++            torch.save(optimizer.state_dict(), checkpoint / 'optimizer.pt')
++            torch.save(scheduler.state_dict(), checkpoint / 'scheduler.pt')
++            torch.save(
++                {'cpu': torch.get_rng_state(), 'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
++                checkpoint / 'rng_state.pt')
++            (checkpoint / 'mem2w_dual_state.json').write_text(
++                json.dumps({'global_step': update_index, 'total_updates': total_updates, 'stage': metrics['stage']}, indent=2)
++                + '\n', encoding='utf-8')
++            with (output_dir / 'training_metrics.jsonl').open('a', encoding='utf-8') as stream:
++                stream.write(json.dumps({'global_step': update_index, **metrics}, ensure_ascii=False) + '\n')
++        if world_size > 1:
++            dist.barrier()
++    summary = {
++        'status': 'completed',
++        'global_step': max(start_step, total_updates),
++        'logs': logs,
++        'trainable': [name for name, parameter in model.named_parameters() if parameter.requires_grad],
++        'output_dir': str(output_dir),
++        'memory_shapes': {key: list(value.shape) for key, value in get_memory_module(model).state_dict().items()},
++        'accumulation_steps': ns.accumulation_steps,
++        'lr_warmup_fraction': ns.lr_warmup_fraction,
++        'distributed_backend': ns.distributed_backend if world_size > 1 else None,
++        'world_size': world_size,
++        'stage_plan': stage_plan,
++        'total_updates': total_updates,
++    }
++    if is_main:
++        output_dir.mkdir(parents=True, exist_ok=True)
++        (output_dir / 'training_summary.json').write_text(
++            json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
++        print(json.dumps(summary, ensure_ascii=False, indent=2))
++    if world_size > 1:
++        dist.barrier()
++        dist.destroy_process_group()
++    return summary
++
++
++def main() -> None:
++    run(build_parser().parse_args())
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/swift/mem2w/__init__.py b/swift/mem2w/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/swift/mem2w/__init__.py
+@@ -0,0 +1,10 @@
++"""Native Mem2W integration for ms-swift's standard SFT pipeline."""
++
++from .config import Mem2WConfig
++from .integration import (attach_memory, freeze_memory_only, get_memory_module, memory_parameters,
++                          set_memory_enabled, set_stop_content_grad)
++
++__all__ = [
++    'Mem2WConfig', 'attach_memory', 'freeze_memory_only', 'get_memory_module', 'memory_parameters',
++    'set_memory_enabled', 'set_stop_content_grad'
++]
+diff --git a/swift/mem2w/config.py b/swift/mem2w/config.py
+new file mode 100644
+--- /dev/null
++++ b/swift/mem2w/config.py
+@@ -0,0 +1,63 @@
++"""Small native configuration object for the Mem2W model extension."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Mapping, Optional
++
++
++@dataclass
++class Mem2WConfig:
++    hidden_size: int = 4096
++    slots: int = 512
++    key_dim: int = 256
++    value_dim: int = 256
++    insertion_index: int = 15
++    rms_eps: float = 1e-6
++    memory_dropout: float = 0.0
++    # Bound the temporary [sequence, slots] memory projection. This changes
++    # only execution tiling; it never changes the token sequence or target.
++    compute_chunk_size: int = 16384
++    # Detach the content/value path while retaining gradients for the query and
++    # key path.  This is part of the checkpointed configuration so a resumed
++    # run has exactly the same objective semantics as the original run.
++    stop_content_grad: bool = False
++
++    def __post_init__(self):
++        for name in ('hidden_size', 'slots', 'key_dim', 'value_dim'):
++            value = getattr(self, name)
++            if not isinstance(value, int) or value <= 0:
++                raise ValueError(f'{name} must be a positive integer')
++        if self.insertion_index < 0:
++            raise ValueError('insertion_index must be non-negative')
++        if self.rms_eps <= 0 or not 0 <= self.memory_dropout < 1:
++            raise ValueError('invalid RMSNorm epsilon or memory dropout')
++        if not isinstance(self.compute_chunk_size, int) or self.compute_chunk_size <= 0:
++            raise ValueError('compute_chunk_size must be a positive integer')
++
++    @classmethod
++    def from_mapping(cls, value: Optional[Mapping[str, Any]]) -> 'Mem2WConfig':
++        if value is None:
++            return cls()
++        if isinstance(value.get('memory'), Mapping):
++            value = value['memory']
++        aliases = {'query_key_dim': 'key_dim', 'insertion_index_0based': 'insertion_index'}
++        fields = set(cls.__dataclass_fields__)
++        normalized = {}
++        for key, item in value.items():
++            if key == 'insert_after_block_1based':
++                normalized['insertion_index'] = int(item) - 1
++            else:
++                normalized[aliases.get(key, key)] = item
++        return cls(**{key: item for key, item in normalized.items() if key in fields})
++
++    @classmethod
++    def from_json(cls, path: Optional[str]) -> 'Mem2WConfig':
++        if not path:
++            return cls()
++        value = json.loads(Path(path).expanduser().read_text(encoding='utf-8'))
++        if not isinstance(value, Mapping):
++            raise ValueError('mem2w_config must contain an object')
++        return cls.from_mapping(value)
+diff --git a/swift/mem2w/dual_trainer.py b/swift/mem2w/dual_trainer.py
+new file mode 100644
+--- /dev/null
++++ b/swift/mem2w/dual_trainer.py
+@@ -0,0 +1,396 @@
++"""Paired action/recall Mem2W training on top of ms-swift templates.
++
++This module intentionally stays below the public ``swift sft`` path.  The
++standard SFT trainer remains a useful one-stream smoke test, while this
++trainer owns the Mem2W-specific logical update:
++
++* encode action and recall rows with the native ms-swift template;
++* normalize each branch by its own supervised-token count;
++* run both forwards before one optimizer step;
++* in stage C, detach only the recall content path (V/W_O), while retaining
++  the recall query/key path (W_Q/K).
++
++It is a small loop rather than a Hugging Face Trainer subclass because the
++paired branches do not have a one-to-one dataset row or a single ``compute_loss``
++call.  Model loading, templates, collation, native tuner registration and
++checkpoint serialization are still provided by ms-swift itself.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import copy
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Mapping, Sequence
++
++import torch
++import torch.nn.functional as F
++import torch.distributed as dist
++from torch.utils.checkpoint import checkpoint
++from contextlib import nullcontext
++
++from .integration import memory_parameters, set_stop_content_grad
++
++
++@dataclass(frozen=True)
++class Mem2WDualConfig:
++    lambda_recall: float = 1.0
++    warmup_fraction: float = 0.20
++    max_grad_norm: float = 1.0
++    accumulation_steps: int = 8
++    loss_chunk_size: int = 0
++    lazy_encode: bool = False
++    activation_offload: bool = False
++    sequence_parallel_size: int = 1
++    stage_plan: tuple[tuple[str, int], ...] | None = None
++
++    def __post_init__(self) -> None:
++        if self.lambda_recall < 0:
++            raise ValueError('lambda_recall must be non-negative')
++        if not 0 < self.warmup_fraction < 1:
++            raise ValueError('warmup_fraction must be strictly between 0 and 1')
++        if self.max_grad_norm <= 0:
++            raise ValueError('max_grad_norm must be positive')
++        if self.accumulation_steps <= 0:
++            raise ValueError('accumulation_steps must be positive')
++        if self.loss_chunk_size < 0:
++            raise ValueError('loss_chunk_size must be non-negative')
++        if self.sequence_parallel_size <= 0:
++            raise ValueError('sequence_parallel_size must be positive')
++        if self.stage_plan is not None:
++            if not self.stage_plan:
++                raise ValueError('stage_plan must not be empty')
++            for stage, updates in self.stage_plan:
++                if stage not in {'W', 'C'}:
++                    raise ValueError(f'unknown Mem2W stage: {stage!r}')
++                if int(updates) <= 0:
++                    raise ValueError('stage_plan update counts must be positive')
++
++
++def chunked_hidden_cross_entropy(hidden, lm_head, labels, chunk_size, *, labels_are_shifted=False):
++    """Exact causal CE without materializing [sequence, vocabulary] logits.
++
++    All original context and target tokens are retained. Only the independent
++    output projection/CE is chunked; attention is still full-sequence. Checkpoint
++    each projection so autograd recomputes logits one chunk at a time.
++    """
++    if chunk_size < 1 or hidden.ndim != 3 or labels.shape != hidden.shape[:2]:
++        raise ValueError('expected hidden [B,L,H], labels [B,L], and positive chunk_size')
++    # With model-parallel loading, the input batch starts on the first device
++    # while the final hidden state and lm_head may live on a later device.
++    labels = labels.to(hidden.device)
++    if labels_are_shifted:
++        # Sequence-parallel input preparation rolls labels before sharding so
++        # each local hidden position already has its next-token target.
++        shifted_labels = labels.reshape(-1)
++        selected_hidden = hidden.reshape(-1, hidden.shape[-1])
++    else:
++        shifted_labels = labels[:, 1:].reshape(-1)
++        selected_hidden = hidden[:, :-1, :].reshape(-1, hidden.shape[-1])
++    valid = shifted_labels.ne(-100)
++    count = int(valid.sum().item())
++    if not count:
++        raise ValueError('branch has zero supervised tokens')
++    selected = selected_hidden[valid]
++    targets = shifted_labels[valid]
++
++    def projected_ce(states, target):
++        logits = lm_head(states).float()
++        return F.cross_entropy(logits, target.to(logits.device), reduction='sum')
++
++    total = hidden.new_zeros((), dtype=torch.float32)
++    for start in range(0, count, chunk_size):
++        chunk_loss = checkpoint(projected_ce, selected[start:start + chunk_size],
++                                targets[start:start + chunk_size], use_reentrant=False)
++        total = total + chunk_loss.to(total.device)
++    loss = total / count
++    if not bool(torch.isfinite(loss).item()):
++        rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
++        print({'event': 'nonfinite_chunked_loss', 'rank': rank,
++               'hidden_finite': bool(torch.isfinite(hidden).all().item()),
++               'hidden_max': float(hidden.detach().float().abs().nan_to_num().max().item()),
++               'loss_value': float(loss.detach().float().nan_to_num().item()),
++               'supervised_tokens': count}, flush=True)
++        raise FloatingPointError('non-finite chunked causal loss')
++    return loss, count
++
++
++class _EncodedRows(Sequence):
++    def __init__(self, template, rows):
++        self.template, self.rows = template, rows
++
++    def __len__(self):
++        return len(self.rows)
++
++    def __getitem__(self, index):
++        result = self.template.encode(copy.deepcopy(dict(self.rows[index])))
++        if isinstance(result, (list, tuple)):
++            raise ValueError('automatic splitting is not supported; preserve full sample context')
++        return result
++
++
++def objective_stage(update_index: int, total_updates: int, warmup_fraction: float,
++                    stage_plan: tuple[tuple[str, int], ...] | None = None) -> str:
++    if update_index < 1 or total_updates < 1:
++        raise ValueError('update indices are one-based and total_updates must be positive')
++    if stage_plan is not None:
++        consumed = 0
++        for stage, updates in stage_plan:
++            consumed += int(updates)
++            if update_index <= consumed:
++                return stage
++        raise ValueError(
++            f'update_index {update_index} exceeds explicit stage plan of {consumed} updates')
++    return 'W' if update_index <= math.floor(warmup_fraction * total_updates) else 'C'
++
++
++def masked_causal_cross_entropy(logits: torch.Tensor,
++                                labels: torch.Tensor,
++                                *,
++                                ignore_index: int = -100,
++                                labels_are_shifted: bool = False) -> tuple[torch.Tensor, int]:
++    if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
++        raise ValueError(f'expected logits [B,L,V] and labels [B,L], got {tuple(logits.shape)} and {tuple(labels.shape)}')
++    if labels.shape[1] < 2:
++        raise ValueError('causal loss needs at least two sequence positions')
++    labels = labels.to(logits.device)
++    if labels_are_shifted:
++        shifted_logits = logits.contiguous()
++        shifted_labels = labels.contiguous()
++    else:
++        shifted_logits = logits[:, :-1, :].contiguous()
++        shifted_labels = labels[:, 1:].contiguous()
++    valid = shifted_labels.ne(ignore_index)
++    token_count = int(valid.sum().item())
++    if token_count == 0:
++        raise ValueError('branch has zero supervised tokens')
++    loss = F.cross_entropy(
++        shifted_logits.view(-1, shifted_logits.shape[-1]),
++        shifted_labels.view(-1),
++        ignore_index=ignore_index,
++        reduction='sum') / token_count
++    if not bool(torch.isfinite(loss).item()):
++        rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
++        print({'event': 'nonfinite_full_loss', 'rank': rank,
++               'logits_finite': bool(torch.isfinite(logits).all().item()),
++               'logits_max': float(logits.detach().float().abs().nan_to_num().max().item()),
++               'loss_value': float(loss.detach().float().nan_to_num().item()),
++               'supervised_tokens': token_count}, flush=True)
++        raise FloatingPointError('non-finite causal loss')
++    return loss, token_count
++
++
++def _model_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
++    """Keep only model inputs; labels/loss scales are consumed locally."""
++
++    excluded = {'labels', 'loss_scale', 'channel', 'lengths', 'template_inputs', '_extra_kwargs'}
++    return {key: value for key, value in batch.items() if key not in excluded}
++
++
++def _to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
++    result = {}
++    for key, value in batch.items():
++        result[key] = value.to(device) if isinstance(value, torch.Tensor) else value
++    return result
++
++
++class Mem2WDualObjectiveTrainer:
++    """Run paired action/recall updates over already loaded native ms-swift state."""
++
++    def __init__(self,
++                 model: Any,
++                 template: Any,
++                 action_rows: Sequence[Mapping[str, Any]],
++                 recall_rows: Sequence[Mapping[str, Any]],
++                 optimizer: torch.optim.Optimizer,
++                 config: Mem2WDualConfig,
++                 *,
++                 total_updates: int,
++                 scheduler: Any | None = None,
++                 accumulation_steps: int | None = None,
++                 device: torch.device | None = None) -> None:
++        if not action_rows or not recall_rows:
++            raise ValueError('action and recall datasets must both contain at least one row')
++        self.model = model
++        self.template = template
++        self.action_rows = list(action_rows)
++        self.recall_rows = list(recall_rows)
++        self.optimizer = optimizer
++        self.config = config
++        self.total_updates = int(total_updates)
++        self.scheduler = scheduler
++        self.accumulation_steps = int(accumulation_steps or config.accumulation_steps)
++        if self.accumulation_steps <= 0:
++            raise ValueError('accumulation_steps must be positive')
++        self.device = device or next(model.parameters()).device
++        self.action_encoded = _EncodedRows(template, self.action_rows)
++        self.recall_encoded = _EncodedRows(template, self.recall_rows)
++        if not config.lazy_encode:
++            self.action_encoded = list(self.action_encoded)
++            self.recall_encoded = list(self.recall_encoded)
++
++    def _batch(self, encoded: Sequence[Mapping[str, Any]], index: int) -> dict[str, Any]:
++        row = encoded[index % len(encoded)]
++        batch = self.template.data_collator([dict(row)])
++        batch = _to_device(batch, self.device)
++        # Sequence-parallel preparation is deliberately deferred until the
++        # branch is about to run. The native helper stores full position ids
++        # in process-global state; preparing action and recall batches up front
++        # would let the later branch overwrite the earlier one's lengths.
++        return batch
++
++    def _valid_token_count(self, batch: Mapping[str, Any]) -> int:
++        labels = batch.get('labels')
++        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < 2:
++            raise ValueError('paired causal batches must contain labels with shape [B,L]')
++        count = int(labels[:, 1:].ne(-100).sum().item())
++        if count == 0 and self.config.sequence_parallel_size <= 1:
++            raise ValueError('paired branch has zero supervised tokens')
++        return count
++
++    def _global_count(self, count: int) -> int:
++        if not dist.is_available() or not dist.is_initialized():
++            return count
++        value = torch.tensor([count], dtype=torch.long, device=self.device)
++        dist.all_reduce(value, op=dist.ReduceOp.SUM)
++        return int(value.item())
++
++    def _forward_loss(self, batch: Mapping[str, Any], *, stop_content_grad: bool) -> tuple[torch.Tensor, int]:
++        set_stop_content_grad(self.model, stop_content_grad)
++        if self.config.loss_chunk_size:
++            if getattr(self.model.config, 'model_type', None) != 'qwen3_5':
++                raise ValueError('chunked hidden loss currently supports native Qwen3.5 only')
++            outputs = self.model.model(**_model_batch(batch), use_cache=False)
++            if self._valid_token_count(batch) == 0:
++                return outputs[0].float().sum() * 0.0, 0
++            return chunked_hidden_cross_entropy(
++                outputs[0], self.model.get_output_embeddings(), batch['labels'],
++                self.config.loss_chunk_size,
++                labels_are_shifted=self.config.sequence_parallel_size > 1)
++        outputs = self.model(**_model_batch(batch), use_cache=False)
++        logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
++        if self._valid_token_count(batch) == 0:
++            return logits.float().sum() * 0.0, 0
++        return masked_causal_cross_entropy(
++            logits, batch['labels'], labels_are_shifted=self.config.sequence_parallel_size > 1)
++
++    def _backward_loss(self, batch: Mapping[str, Any], *, stop_content_grad: bool,
++                       weight: float) -> tuple[float, int]:
++        """Forward and backward one branch, optionally offloading saved activations.
++
++        ``save_on_cpu`` is deliberately opt-in. It is useful for the few
++        lossless rows whose full context is larger than the four-card C500
++        device-parallel memory budget; it preserves every token while trading
++        GPU memory for host-memory traffic. The context must include backward,
++        not just forward, because autograd saves tensors during the forward.
++        """
++        context = (torch.autograd.graph.save_on_cpu(pin_memory=False)
++                   if self.config.activation_offload else nullcontext())
++        with context:
++            loss, count = self._forward_loss(batch, stop_content_grad=stop_content_grad)
++            (loss * weight).backward()
++        return float(loss.detach().cpu()), count
++
++    @staticmethod
++    def _synchronize_gradients(parameters: Sequence[torch.nn.Parameter]) -> None:
++        """Average the four memory gradients when launched under torchrun.
++
++        The paired trainer deliberately does not wrap the frozen Qwen backbone
++        in ``DistributedDataParallel``: only the attached Mem2W tensors are
++        trainable, and the native hook-based model path must remain unchanged.
++        Each rank therefore performs the small explicit all-reduce here.
++        """
++        if not dist.is_available() or not dist.is_initialized():
++            return
++        world_size = dist.get_world_size()
++        for parameter in parameters:
++            gradient = parameter.grad
++            if gradient is None:
++                gradient = torch.zeros_like(parameter)
++            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
++            parameter.grad = gradient / world_size
++
++    def train_step(self, update_index: int) -> dict[str, Any]:
++        started = time.monotonic()
++        if self.device.type == 'cuda':
++            torch.cuda.reset_peak_memory_stats(self.device)
++        stage = objective_stage(update_index, self.total_updates, self.config.warmup_fraction,
++                                self.config.stage_plan)
++        self.model.train()
++        self.optimizer.zero_grad(set_to_none=True)
++
++        base_index = (update_index - 1) * self.accumulation_steps
++        action_batches = [self._batch(self.action_encoded, base_index + offset)
++                          for offset in range(self.accumulation_steps)]
++        recall_batches = [self._batch(self.recall_encoded, base_index + offset)
++                          for offset in range(self.accumulation_steps)]
++        action_counts = [self._valid_token_count(batch) for batch in action_batches]
++        recall_counts = [self._valid_token_count(batch) for batch in recall_batches]
++        action_tokens = self._global_count(sum(action_counts))
++        recall_tokens = self._global_count(sum(recall_counts))
++        if action_tokens == 0 or recall_tokens == 0:
++            raise ValueError('paired dataset has zero supervised tokens across sequence-parallel ranks')
++        action_loss_sum = 0.0
++        for batch, count in zip(action_batches, action_counts):
++            if self.config.sequence_parallel_size > 1:
++                from swift.sequence_parallel import sequence_parallel
++                sequence_parallel.prepare_inputs(batch)
++            action_loss, _ = self._backward_loss(
++                batch, stop_content_grad=False, weight=count / action_tokens)
++            action_loss_sum += action_loss * count
++        recall_loss_sum = 0.0
++        for batch, count in zip(recall_batches, recall_counts):
++            if self.config.sequence_parallel_size > 1:
++                from swift.sequence_parallel import sequence_parallel
++                sequence_parallel.prepare_inputs(batch)
++            recall_loss, _ = self._backward_loss(
++                batch,
++                stop_content_grad=(stage == 'C'),
++                weight=self.config.lambda_recall * count / recall_tokens)
++            recall_loss_sum += recall_loss * count
++
++        parameters = memory_parameters(self.model)
++        self._synchronize_gradients(parameters)
++        gradients = [parameter for parameter in parameters if parameter.grad is not None]
++        if not gradients:
++            raise RuntimeError('no Mem2W parameter received a gradient')
++        total_norm = torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm)
++        if not bool(torch.isfinite(total_norm).item()):
++            raise FloatingPointError('non-finite Mem2W gradient norm')
++        grad_norms = {name: float(parameter.grad.float().norm().item()) if parameter.grad is not None else None
++                      for name, parameter in self.model.named_parameters() if parameter.requires_grad}
++        before = [parameter.detach().clone() for parameter in parameters]
++        self.optimizer.step()
++        deltas = [float((parameter.detach().float() - initial.float()).norm().item())
++                  for parameter, initial in zip(parameters, before)]
++        if self.scheduler is not None:
++            self.scheduler.step()
++        return {
++            'stage': stage,
++            'loss_action': action_loss_sum / action_tokens,
++            'loss_recall': recall_loss_sum / recall_tokens,
++            'tokens_action': action_tokens,
++            'tokens_recall': recall_tokens,
++            'memory_grad_norm': float(total_norm.detach().cpu()),
++            'learning_rate': float(self.optimizer.param_groups[0]['lr']),
++            'parameter_grad_norms': grad_norms,
++            'parameter_delta_norms': deltas,
++            'seconds': time.monotonic() - started,
++            'peak_memory_bytes': torch.cuda.max_memory_allocated(self.device) if self.device.type == 'cuda' else 0,
++        }
++
++
++def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
++    rows = []
++    with Path(path).expanduser().open('r', encoding='utf-8') as stream:
++        for line_no, line in enumerate(stream, 1):
++            if not line.strip() or line.lstrip().startswith('#'):
++                continue
++            value = json.loads(line)
++            if not isinstance(value, dict):
++                raise ValueError(f'{path}:{line_no}: expected a JSON object')
++            rows.append(value)
++    return rows
+diff --git a/swift/mem2w/integration.py b/swift/mem2w/integration.py
+new file mode 100644
+--- /dev/null
++++ b/swift/mem2w/integration.py
+@@ -0,0 +1,200 @@
++"""Attach Mem2W to a loaded ms-swift/Transformers decoder without replacing layers."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from copy import copy
++import inspect
++from typing import Optional
++
++import torch
++
++from .config import Mem2WConfig
++from .memory import PersistentKVMemory
++
++
++def _decoder_layers(model):
++    candidates = (
++        getattr(getattr(model, 'model', None), 'layers', None),
++        getattr(getattr(getattr(model, 'model', None), 'language_model', None), 'layers', None),
++        getattr(getattr(model, 'language_model', None), 'layers', None),
++        getattr(model, 'layers', None),
++    )
++    for layers in candidates:
++        if layers is not None and hasattr(layers, '__len__') and hasattr(layers, '__getitem__'):
++            return layers
++    raise AttributeError('could not find decoder layers on the loaded model')
++
++
++def _first_hidden(output):
++    if isinstance(output, (tuple, list)):
++        return output[0]
++    if isinstance(output, Mapping):
++        return output.get('hidden_states', next(iter(output.values())))
++    return output
++
++
++def _replace_hidden(output, hidden):
++    if isinstance(output, tuple):
++        return (hidden, *output[1:])
++    if isinstance(output, list):
++        return [hidden, *output[1:]]
++    if isinstance(output, Mapping):
++        key = 'hidden_states' if 'hidden_states' in output else next(iter(output))
++        # ModelOutput (used by Transformers decoder blocks) is a dict subclass
++        # with attribute access.  Converting it to a plain dict silently drops
++        # that contract and can break downstream layers.  Preserve the concrete
++        # mapping type whenever possible, with a namedtuple-style fallback for
++        # immutable mapping outputs.
++        try:
++            result = copy(output)
++            result[key] = hidden
++            return result
++        except (TypeError, AttributeError, KeyError):
++            if hasattr(output, '_replace'):
++                return output._replace(**{key: hidden})
++            try:
++                return type(output)(**{**dict(output), key: hidden})
++            except Exception as exc:
++                raise TypeError(f'cannot preserve decoder output mapping type {type(output)!r}') from exc
++    return hidden
++
++
++def _is_binary_2d_mask(candidate, shape):
++    """Return whether *candidate* is an actual 2-D padding/attention mask.
++
++    Decoder hooks receive positional arguments whose second slot is normally
++    ``attention_mask`` but can be ``position_ids`` for model variants.  Both can
++    be rank-2 tensors, so rank/shape alone is not a safe discriminator.  A
++    binary mask check prevents position ids from being interpreted as a mask.
++    """
++    if candidate is None or not isinstance(candidate, torch.Tensor):
++        return False
++    if candidate.ndim != 2 or tuple(candidate.shape[:2]) != tuple(shape[:2]):
++        return False
++    if candidate.dtype == torch.bool:
++        return True
++    if not candidate.is_floating_point() and candidate.dtype not in (torch.uint8, torch.int8, torch.int16,
++                                                                        torch.int32, torch.int64):
++        return False
++    # Avoid materializing a large unique tensor.  Attention masks are finite and
++    # bounded to {0, 1}; position ids generally contain values greater than 1.
++    probe = candidate.detach()
++    if probe.numel() == 0 or (probe.is_floating_point() and not torch.isfinite(probe).all()):
++        return False
++    return bool((probe.min() >= 0).item() and (probe.max() <= 1).item())
++
++
++def _attention_mask_positional_index(layer):
++    try:
++        parameters = list(inspect.signature(layer.forward).parameters.values())
++        for index, parameter in enumerate(parameters):
++            if parameter.name == 'attention_mask':
++                return index
++        return None
++    except (TypeError, ValueError):
++        return None
++
++
++def _memory_hook(layer, args, kwargs, output):
++    hidden = _first_hidden(output)
++    attention_mask = kwargs.get('attention_mask')
++    if not _is_binary_2d_mask(attention_mask, hidden.shape):
++        attention_mask = None
++    if attention_mask is None:
++        # Prefer the decoder signature over a value-only heuristic.  Qwen3.5
++        # puts ``position_embeddings`` before ``attention_mask``; looking only
++        # at args[1] would miss its mask (or confuse it with position ids).
++        positional_index = getattr(layer, '_mem2w_attention_arg_index', None)
++        if positional_index is not None and positional_index < len(args):
++            candidate = args[positional_index]
++            if _is_binary_2d_mask(candidate, hidden.shape):
++                attention_mask = candidate
++        # The fallback is retained for wrappers exposing only *args/**kwargs.
++        elif len(args) > 1 and _is_binary_2d_mask(args[1], hidden.shape):
++            attention_mask = args[1]
++    hidden = layer._mem2w_memory(
++        hidden,
++        enabled=layer._mem2w_enabled,
++        attention_mask=attention_mask,
++        stop_content_grad=layer._mem2w_stop_content_grad,
++    )
++    return _replace_hidden(output, hidden)
++
++
++def attach_memory(model, config: Optional[Mem2WConfig] = None):
++    layers = _decoder_layers(model)
++    model_config = getattr(model, 'config', None)
++    text_config = getattr(model_config, 'text_config', None)
++    hidden_size = getattr(model_config, 'hidden_size', None) or getattr(text_config, 'hidden_size', None)
++    if config is None:
++        config = Mem2WConfig(hidden_size=int(hidden_size)) if hidden_size is not None else Mem2WConfig()
++    if config.insertion_index >= len(layers):
++        raise IndexError(f'insertion_index {config.insertion_index} is outside {len(layers)} decoder blocks')
++    layer = layers[config.insertion_index]
++    if hasattr(layer, '_mem2w_memory'):
++        raise ValueError('Mem2W is already attached to this decoder block')
++    if hidden_size is not None and int(hidden_size) != config.hidden_size:
++        raise ValueError(f'Mem2W hidden_size={config.hidden_size} does not match model hidden_size={hidden_size}')
++
++    reference = next(layer.parameters(), None)
++    memory = PersistentKVMemory(config)
++    if reference is not None:
++        dtype = reference.dtype if reference.is_floating_point() else torch.float32
++        memory.to(device=reference.device, dtype=dtype)
++    layer.add_module('_mem2w_memory', memory)
++    layer._mem2w_enabled = True
++    layer._mem2w_stop_content_grad = bool(config.stop_content_grad)
++    # Cache this once: inspecting a decoder signature inside every forward
++    # would add avoidable overhead to long SFT runs.
++    layer._mem2w_attention_arg_index = _attention_mask_positional_index(layer)
++    layer._mem2w_hook_handle = layer.register_forward_hook(_memory_hook, with_kwargs=True)
++    object.__setattr__(model, '_mem2w_memory_layer', layer)
++    object.__setattr__(model, '_mem2w_insertion_index', config.insertion_index)
++    object.__setattr__(model, '_mem2w_config', config)
++    return model
++
++
++def get_memory_module(model):
++    layer = getattr(model, '_mem2w_memory_layer', None)
++    if layer is None:
++        for candidate in _decoder_layers(model):
++            if hasattr(candidate, '_mem2w_memory'):
++                layer = candidate
++                break
++    if layer is None:
++        raise ValueError('model has no attached Mem2W memory')
++    return layer._mem2w_memory
++
++
++def _memory_layer(model):
++    layer = getattr(model, '_mem2w_memory_layer', None)
++    if layer is not None:
++        return layer
++    for candidate in _decoder_layers(model):
++        if hasattr(candidate, '_mem2w_memory'):
++            return candidate
++    raise ValueError('model has no attached Mem2W memory')
++
++
++def freeze_memory_only(model):
++    model.requires_grad_(False)
++    memory = get_memory_module(model)
++    for parameter in memory.parameters():
++        parameter.requires_grad_(True)
++    trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
++    if len(trainable) != 4 or not all(getattr(parameter, 'is_mem2w_parameter', False) for _, parameter in trainable):
++        raise RuntimeError(f'Mem2W memory-only freeze failed: {[name for name, _ in trainable]}')
++    return model
++
++
++def memory_parameters(model):
++    return [parameter for parameter in get_memory_module(model).parameters() if parameter.requires_grad]
++
++
++def set_memory_enabled(model, enabled: bool):
++    _memory_layer(model)._mem2w_enabled = bool(enabled)
++
++
++def set_stop_content_grad(model, enabled: bool):
++    _memory_layer(model)._mem2w_stop_content_grad = bool(enabled)
+diff --git a/swift/mem2w/memory.py b/swift/mem2w/memory.py
+new file mode 100644
+--- /dev/null
++++ b/swift/mem2w/memory.py
+@@ -0,0 +1,85 @@
++"""Persistent key/value memory used by the native ms-swift Mem2W path."""
++
++from __future__ import annotations
++
++import torch
++from torch import Tensor, nn
++import torch.nn.functional as F
++from torch.utils.checkpoint import checkpoint
++
++
++class PersistentKVMemory(nn.Module):
++
++    def __init__(self, config):
++        super().__init__()
++        self.hidden_size = config.hidden_size
++        self.slots = config.slots
++        self.key_dim = config.key_dim
++        self.value_dim = config.value_dim
++        self.scale = config.key_dim**-0.5
++        self.rms_eps = config.rms_eps
++        self.compute_chunk_size = config.compute_chunk_size
++        self.W_Q = nn.Parameter(torch.empty(config.hidden_size, config.key_dim))
++        self.K = nn.Parameter(torch.empty(config.slots, config.key_dim))
++        self.V = nn.Parameter(torch.empty(config.slots, config.value_dim))
++        self.W_O = nn.Parameter(torch.empty(config.value_dim, config.hidden_size))
++        for parameter in (self.W_Q, self.K, self.V, self.W_O):
++            parameter.is_mem2w_parameter = True
++        self.dropout = nn.Dropout(config.memory_dropout) if config.memory_dropout else nn.Identity()
++        self.reset_parameters()
++
++    def reset_parameters(self):
++        nn.init.xavier_uniform_(self.W_Q)
++        nn.init.normal_(self.K, std=1.0)
++        nn.init.normal_(self.V, std=0.02)
++        nn.init.zeros_(self.W_O)
++
++    def forward(self, hidden_states: Tensor, *, enabled=True, attention_mask=None, stop_content_grad=False):
++        if not enabled:
++            return hidden_states
++        if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
++            raise ValueError('memory expects hidden states with shape [batch, sequence, hidden_size]')
++        work_dtype = torch.float32 if hidden_states.dtype in (torch.float16, torch.bfloat16) else hidden_states.dtype
++        keys = self.K.to(work_dtype)
++        values = self.V.detach().to(work_dtype) if stop_content_grad else self.V.to(work_dtype)
++        output = self.W_O.detach().to(work_dtype) if stop_content_grad else self.W_O.to(work_dtype)
++        # Qwen3.5 is normally bf16 on CUDA.  SDPA fuses the softmax and the
++        # two memory matmuls, while the old path materialized a full
++        # [batch, sequence_chunk, slots] float32 score tensor in Python.
++        # Keep the RMS normalization in FP32, but use the model dtype for the
++        # fused attention kernel.  CPU/FP32 callers retain the reference path.
++        use_sdpa = (hidden_states.is_cuda and hidden_states.dtype in (torch.float16, torch.bfloat16)
++                    and hasattr(F, 'scaled_dot_product_attention'))
++        chunk_size = min(self.compute_chunk_size, hidden_states.shape[1])
++
++        def project(chunk, mask):
++            normalized = chunk.to(work_dtype)
++            normalized = normalized * normalized.square().mean(dim=-1, keepdim=True).add(self.rms_eps).rsqrt()
++            query = normalized.matmul(self.W_Q.to(work_dtype))
++            if use_sdpa:
++                kernel_dtype = hidden_states.dtype
++                query = query.to(kernel_dtype).unsqueeze(1)
++                key = keys.to(kernel_dtype).unsqueeze(0).unsqueeze(0)
++                value = values.to(kernel_dtype).unsqueeze(0).unsqueeze(0)
++                attended = F.scaled_dot_product_attention(
++                    query, key, value, dropout_p=0.0, scale=self.scale).squeeze(1)
++                residual = self.dropout(attended.matmul(output.to(kernel_dtype))).to(hidden_states.dtype)
++            else:
++                weights = torch.softmax(query.matmul(keys.transpose(0, 1)) * self.scale, dim=-1)
++                residual = self.dropout(weights.matmul(values).matmul(output)).to(hidden_states.dtype)
++            if mask is not None:
++                residual = residual * mask.to(dtype=residual.dtype).unsqueeze(-1)
++            return chunk + residual
++
++        chunks = []
++        for start in range(0, hidden_states.shape[1], chunk_size):
++            stop = min(start + chunk_size, hidden_states.shape[1])
++            chunk = hidden_states[:, start:stop]
++            mask = None
++            if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape[:2] == hidden_states.shape[:2]:
++                mask = attention_mask[:, start:stop]
++            if self.training and torch.is_grad_enabled() and hidden_states.shape[1] > chunk_size:
++                chunks.append(checkpoint(project, chunk, mask, use_reentrant=False))
++            else:
++                chunks.append(project(chunk, mask))
++        return torch.cat(chunks, dim=1) if len(chunks) > 1 else chunks[0]
+diff --git a/swift/model/models/qwen.py b/swift/model/models/qwen.py
+--- a/swift/model/models/qwen.py
++++ b/swift/model/models/qwen.py
+@@ -1287,10 +1287,19 @@
+ 
+ 
+ def _get_linear_attention_kernels(mod: torch.nn.Module, cu_seqlens):
+-    _try_import_flash_linear_attention_kernels()
++    # FLA's Triton GatedDeltaNet kernel autotunes by benchmarking candidate
++    # configurations.  On very long sequences this benchmark can itself OOM
++    # before the actual backward pass starts.  Keep the native FLA path as the
++    # default, but allow a caller to select the Transformers torch fallback for
++    # constrained environments through the normal `swift sft` entrypoint.
++    force_torch_fallback = os.environ.get('SWIFT_QWEN35_DISABLE_FLA', '0') == '1'
++    if not force_torch_fallback:
++        _try_import_flash_linear_attention_kernels()
++    torch_fallback = (
++        getattr(mod.__class__, '_swift_torch_chunk_gated_delta_rule', None)
++        or getattr(mod, 'chunk_gated_delta_rule', None))
+     torch_or_fla_chunk_gated_delta_rule = (
+-        chunk_gated_delta_rule or getattr(mod.__class__, '_swift_torch_chunk_gated_delta_rule', None)
+-        or getattr(mod, 'chunk_gated_delta_rule', None))
++        torch_fallback if force_torch_fallback else (chunk_gated_delta_rule or torch_fallback))
+     if torch_or_fla_chunk_gated_delta_rule is None:
+         raise ImportError('Qwen3.5 linear attention requires a gated delta rule implementation. Please install '
+                           'flash-linear-attention or use a transformers version that provides the torch fallback.')
+@@ -1298,7 +1307,7 @@
+         raise ImportError('Qwen3.5 linear attention packing/padding-free with multiple sequences requires '
+                           'flash-linear-attention; the torch fallback does not support packed sequence boundaries. '
+                           'Install: https://github.com/fla-org/flash-linear-attention#installation')
+-    return causal_conv1d, torch_or_fla_chunk_gated_delta_rule
++    return (None if force_torch_fallback else causal_conv1d), torch_or_fla_chunk_gated_delta_rule
+ 
+ 
+ def _run_qwen3_5_causal_conv1d(mixed_qkv, conv_weight, conv_bias, activation, cu_seqlens, causal_conv1d_fn):
+@@ -1432,6 +1441,11 @@
+     # transformers==5.2 torch_chunk_gated_delta_rule has no **kwargs, and later torch fallbacks ignore cu_seqlens.
+     if cu_seqlens is not None and selected_chunk_gated_delta_rule is chunk_gated_delta_rule:
+         chunk_kwargs['cu_seqlens'] = cu_seqlens
++    if selected_chunk_gated_delta_rule is chunk_gated_delta_rule:
++        chunk_size = int(os.environ.get('SWIFT_QWEN35_FLA_CHUNK_SIZE', '64'))
++        if chunk_size not in (16, 32, 64):
++            raise ValueError('SWIFT_QWEN35_FLA_CHUNK_SIZE must be 16, 32, or 64')
++        chunk_kwargs['chunk_size'] = chunk_size
+     core_attn_out, last_recurrent_state = selected_chunk_gated_delta_rule(query, key, value, **chunk_kwargs)
+ 
+     if cache_params is not None:
+diff --git a/swift/pipelines/train/sft.py b/swift/pipelines/train/sft.py
+--- a/swift/pipelines/train/sft.py
++++ b/swift/pipelines/train/sft.py
+@@ -1,11 +1,12 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
++import json
+ import os
+-from datasets import Dataset as HfDataset
++from datasets import Dataset as HfDataset, Features, Sequence, Value
+ from typing import List, Optional, Union
+ 
+ from swift.arguments import SftArguments
+ from swift.dataset import (AddLengthPreprocessor, DatasetLoader, EncodePreprocessor, IterablePackingDataset,
+-                           LazyLLMDataset, PackingDataset)
++                           LazyLLMDataset, PackingDataset, load_dataset)
+ from swift.infer_engine import prepare_generation_config
+ from swift.ray_utils import RayHelper
+ from swift.sequence_parallel import sequence_parallel
+@@ -16,6 +17,54 @@
+ from .tuner import TunerMixin
+ 
+ logger = get_logger()
++
++
++def _load_mem2w_json_dataset(path):
++    """Load Mem2W JSONL with an explicit nested Arrow schema.
++
++    The JSON loader infers an empty list as list<null> when the first
++    examples have no tool calls. AutomationBench later contains real
++    tool-call objects, so declare the schema up front.
++    """
++    with open(path, encoding='utf-8') as f:
++        rows = [json.loads(line) for line in f if line.strip()]
++    call_feature = {
++            'id': Value('string'),
++            'type': Value('string'),
++            'name': Value('string'),
++            'arguments': Value('string'),
++            'function': {
++                'name': Value('string'),
++                'arguments': Value('string'),
++            },
++    }
++    message_feature = {
++        'role': Value('string'),
++        'content': Value('string'),
++        'loss': Value('bool'),
++        'tool_call_id': Value('string'),
++        'tool_calls': [call_feature],
++    }
++    feature_map = {}
++    for row in rows:
++        for key in row:
++            if key in feature_map:
++                continue
++            if key == 'messages':
++                feature_map[key] = [message_feature]
++            elif key in {'retrieved_memory_ids', 'selected_memory_ids'}:
++                feature_map[key] = Sequence(Value('string'))
++            elif key == 'chat_template_kwargs':
++                feature_map[key] = Features({'enable_thinking': Value('bool')})
++            elif key == 'success':
++                feature_map[key] = Value('bool')
++            elif key in {'reward', 'partial_credit', 'context_chars', 'payload_chars',
++                         'retrieval_k_requested', 'retrieval_k_returned', 'num_actions',
++                         'epoch', 'step_index'}:
++                feature_map[key] = Value('float32' if key == 'reward' else 'int64')
++            else:
++                feature_map[key] = Value('string')
++    return HfDataset.from_list(rows, features=Features(feature_map))
+ 
+ 
+ @RayHelper.worker(group=['default'])
+@@ -96,8 +145,45 @@
+             append_to_jsonl(val_dataset_path, val_dataset.to_list())
+             logger.info(f'The split dataset from the training set will be saved at: `{val_dataset_path}`.')
+ 
++    def _prepare_mem2w_dataset(self):
++        """Prepare paired action/recall streams for the native Swift Trainer."""
++        args = self.args
++        if args.streaming:
++            raise ValueError('Mem2W paired SFT currently requires non-streaming datasets')
++        if not args.mem2w_recall_dataset:
++            raise ValueError('Mem2W requires --mem2w_recall_dataset')
++
++        action_dataset = _load_mem2w_json_dataset(args.dataset[0])
++        recall_dataset = _load_mem2w_json_dataset(args.mem2w_recall_dataset[0])
++
++        action_dataset, _ = self._encode_dataset(action_dataset, None, pre_process=True)
++        recall_dataset, _ = self._encode_dataset(recall_dataset, None, pre_process=True)
++        action_dataset, _ = self._post_process_datasets([action_dataset, None])
++        recall_dataset, _ = self._post_process_datasets([recall_dataset, None])
++
++        from swift.trainers.mem2w_trainer import Mem2WDualDataset, parse_stage_plan
++        paired_dataset = Mem2WDualDataset(
++            action_dataset,
++            recall_dataset,
++            group_size=args.mem2w_accumulation_steps)
++        stage_plan = parse_stage_plan(args.mem2w_stage_plan)
++        if stage_plan is not None:
++            total_steps = sum(count for _stage, count in stage_plan)
++            args.training_args.max_steps = total_steps
++            args.training_args.num_train_epochs = 1
++        logger.info(
++            f'Mem2W paired dataset: action_rows={len(action_dataset)}, recall_rows={len(recall_dataset)}, '
++            f'logical_updates={len(paired_dataset)}, group_size={args.mem2w_accumulation_steps}, '
++            f'stage_plan={stage_plan}')
++        return paired_dataset, None
++
+     @RayHelper.function(group='default')
+     def _prepare_dataset(self):
++        if self.args.tuner_type == 'mem2w':
++            return self._prepare_mem2w_dataset()
++        return self._prepare_dataset_standard()
++
++    def _prepare_dataset_standard(self):
+         args = self.args
+         # Defer encoding to the training phase
+         pre_process = not (hasattr(args, 'rlhf_type') and args.rlhf_type in ['grpo', 'gkd'])
+@@ -177,6 +263,22 @@
+         self.train_msg['model_parameter_info'] = model_parameter_info
+         logger.info(f'model_parameter_info: {model_parameter_info}')
+ 
++        if args.tuner_type == 'mem2w':
++            # TrainerFactory intentionally filters pipeline-only dataclass
++            # fields out of Seq2SeqTrainingArguments.  Copy the Mem2W knobs
++            # onto that native args object so the Trainer remains self
++            # contained while all lifecycle handling stays in ms-swift.
++            for name in (
++                    'mem2w_lambda_recall', 'mem2w_warmup_fraction', 'mem2w_stage_plan',
++                    'mem2w_loss_chunk_size', 'mem2w_activation_offload'):
++                setattr(args.training_args, name, getattr(args, name))
++
++        # ``sft_loss_chunk_size`` is a Trainer-level optimization and is
++        # intentionally available to ordinary LoRA/full SFT as well as Mem2W.
++        # Keep it on the native TrainingArguments object after the factory
++        # filters pipeline-only dataclass fields.
++        setattr(args.training_args, 'sft_loss_chunk_size', getattr(args, 'sft_loss_chunk_size', 0))
++
+         trainer_cls = TrainerFactory.get_trainer_cls(args)
+         trainer = trainer_cls(
+             model=self.model,
+diff --git a/swift/trainers/__init__.py b/swift/trainers/__init__.py
+--- a/swift/trainers/__init__.py
++++ b/swift/trainers/__init__.py
+@@ -8,6 +8,7 @@
+     from .arguments import Seq2SeqTrainingArguments, TrainArgumentsMixin, TrainingArguments
+     from .embedding_trainer import EmbeddingTrainer
+     from .mixin import DataLoaderMixin, SwiftMixin
++    from .mem2w_trainer import Mem2WDualTrainer
+     from .reranker_trainer import RerankerTrainer
+     from .seq2seq_trainer import Seq2SeqTrainer
+     from .trainer import Trainer
+@@ -19,6 +20,7 @@
+         'arguments': ['TrainArgumentsMixin', 'Seq2SeqTrainingArguments', 'TrainingArguments'],
+         'embedding_trainer': ['EmbeddingTrainer'],
+         'mixin': ['DataLoaderMixin', 'SwiftMixin'],
++        'mem2w_trainer': ['Mem2WDualTrainer'],
+         'reranker_trainer': ['RerankerTrainer'],
+         'seq2seq_trainer': ['Seq2SeqTrainer'],
+         'trainer': ['Trainer'],
+diff --git a/swift/trainers/mem2w_trainer.py b/swift/trainers/mem2w_trainer.py
+new file mode 100644
+--- /dev/null
++++ b/swift/trainers/mem2w_trainer.py
+@@ -0,0 +1,307 @@
++"""Native ms-swift Trainer integration for paired Mem2W SFT.
++
++The dataset is grouped into logical updates (``mem2w_accumulation_steps``
++rows per branch).  Hugging Face/Swift still owns the dataloader, DDP,
++autocast, backward, optimizer, scheduler, checkpoint and resume lifecycle;
++this trainer only supplies the paired objective.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Mapping, Sequence
++from pathlib import Path
++from typing import Any
++
++import torch
++import torch.distributed as dist
++from contextlib import nullcontext
++
++from transformers import Trainer as HfTrainer, TrainerCallback
++from transformers.modeling_utils import unwrap_model
++
++from swift.mem2w.dual_trainer import (chunked_hidden_cross_entropy, masked_causal_cross_entropy,
++                                      _model_batch)
++from swift.mem2w.integration import memory_parameters, set_stop_content_grad
++from swift.tuners.mem2w import Mem2WTuner
++from .seq2seq_trainer import Seq2SeqTrainer
++
++
++class Mem2WDualDataset(Sequence):
++    """Pair action and recall rows into one Trainer example per logical update."""
++
++    def __init__(self, action_dataset, recall_dataset, group_size: int = 8):
++        if len(action_dataset) == 0 or len(recall_dataset) == 0:
++            raise ValueError('Mem2W action and recall datasets must both be non-empty')
++        if group_size <= 0:
++            raise ValueError('Mem2W group_size must be positive')
++        self.action_dataset = action_dataset
++        self.recall_dataset = recall_dataset
++        self.group_size = int(group_size)
++
++    def __len__(self):
++        logical_updates = math.ceil(max(len(self.action_dataset), len(self.recall_dataset)) / self.group_size)
++        # Swift's distributed batch sampler expects a length divisible by the
++        # data-parallel world size.  Padding here repeats the last logical
++        # pair; the modulo indexing in __getitem__ keeps the branch aligned.
++        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
++        return math.ceil(logical_updates / world_size) * world_size
++
++    def __getitem__(self, index):
++        start = int(index) * self.group_size
++        action = [self.action_dataset[(start + offset) % len(self.action_dataset)]
++                  for offset in range(self.group_size)]
++        recall = [self.recall_dataset[(start + offset) % len(self.recall_dataset)]
++                  for offset in range(self.group_size)]
++        return {'action': action, 'recall': recall}
++
++
++def parse_stage_plan(value: str | None) -> tuple[tuple[str, int], ...] | None:
++    if value is None or not str(value).strip():
++        return None
++    result = []
++    for item in str(value).split(','):
++        stage, separator, count = item.strip().partition(':')
++        if separator != ':' or stage not in {'W', 'C'}:
++            raise ValueError('mem2w_stage_plan entries must use W:<updates> or C:<updates>')
++        count = int(count)
++        if count <= 0:
++            raise ValueError('mem2w_stage_plan update counts must be positive')
++        result.append((stage, count))
++    return tuple(result)
++
++
++def stage_for_step(step: int, total_steps: int, warmup_fraction: float,
++                   stage_plan: tuple[tuple[str, int], ...] | None) -> str:
++    if stage_plan is not None:
++        consumed = 0
++        for stage, count in stage_plan:
++            consumed += count
++            if step <= consumed:
++                return stage
++        raise ValueError(f'Mem2W step {step} exceeds explicit stage plan of {consumed} steps')
++    return 'W' if step <= math.floor(warmup_fraction * total_steps) else 'C'
++
++
++def _prepare_nested(value, device):
++    if isinstance(value, Mapping):
++        return {key: _prepare_nested(item, device) for key, item in value.items()}
++    if isinstance(value, tuple):
++        return tuple(_prepare_nested(item, device) for item in value)
++    if isinstance(value, list):
++        return [_prepare_nested(item, device) for item in value]
++    if isinstance(value, torch.Tensor):
++        return value.to(device)
++    return value
++
++
++class _Mem2WBoundarySaveCallback(TrainerCallback):
++    """Save exactly at the non-uniform W/C/W stage boundaries."""
++
++    def __init__(self, boundaries):
++        self.boundaries = frozenset(int(item) for item in boundaries)
++
++    def on_step_end(self, args, state, control, **kwargs):
++        if int(state.global_step) in self.boundaries:
++            control.should_save = True
++        return control
++
++
++class Mem2WDualTrainer(Seq2SeqTrainer):
++    """ms-swift/Transformers Trainer with the Mem2W W/C paired objective."""
++
++    def __init__(self, *args, **kwargs):
++        self._mem2w_last_metrics = {}
++        self._mem2w_manual_grad_sync = False
++        self._mem2w_action_metric = 0.0
++        self._mem2w_recall_metric = 0.0
++        super().__init__(*args, **kwargs)
++        stage_plan = parse_stage_plan(getattr(self.args, 'mem2w_stage_plan', None))
++        if stage_plan:
++            boundaries = []
++            consumed = 0
++            for _, count in stage_plan:
++                consumed += count
++                boundaries.append(consumed)
++            self.add_callback(_Mem2WBoundarySaveCallback(boundaries))
++
++    def _get_data_collator(self, args, template):
++        def collate(features):
++            action_rows = [row for feature in features for row in feature['action']]
++            recall_rows = [row for feature in features for row in feature['recall']]
++            return {
++                'action': [template.data_collator([dict(row)]) for row in action_rows],
++                'recall': [template.data_collator([dict(row)]) for row in recall_rows],
++            }
++
++        return collate
++
++    def _get_collator_with_removed_columns(self, data_collator, description=None):
++        # ``action`` and ``recall`` are intentionally not model.forward fields.
++        # Keep the paired envelope intact for the custom compute_loss method.
++        return data_collator
++
++    def _prepare_inputs(self, inputs):
++        return _prepare_nested(inputs, self.args.device)
++
++    @staticmethod
++    def _base_model(model):
++        return unwrap_model(model)
++
++    def _global_count(self, count: int) -> int:
++        if not dist.is_available() or not dist.is_initialized():
++            return int(count)
++        value = torch.tensor([count], dtype=torch.long, device=self.args.device)
++        dist.all_reduce(value, op=dist.ReduceOp.SUM)
++        return int(value.item())
++
++    @staticmethod
++    def _valid_count(batch) -> int:
++        labels = batch.get('labels')
++        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < 2:
++            raise ValueError('Mem2W paired batches must contain labels with shape [B,L]')
++        count = int(labels[:, 1:].ne(-100).sum().item())
++        if count <= 0:
++            raise ValueError('Mem2W paired branch has zero supervised tokens')
++        return count
++
++    def _forward_branch(self, model, batch, *, stop_content_grad: bool):
++        base = self._base_model(model)
++        set_stop_content_grad(base, stop_content_grad)
++        count = self._valid_count(batch)
++        if self.args.mem2w_loss_chunk_size:
++            if getattr(base.config, 'model_type', None) != 'qwen3_5':
++                raise ValueError('mem2w_loss_chunk_size currently supports native Qwen3.5 only')
++            # Bypass DDP only for the chunked hidden-state path.  training_step
++            # performs an explicit four-parameter all-reduce afterwards.
++            outputs = base.model(**_model_batch(batch), use_cache=False)
++            loss, _ = chunked_hidden_cross_entropy(
++                outputs[0], base.get_output_embeddings(), batch['labels'], self.args.mem2w_loss_chunk_size)
++            self._mem2w_manual_grad_sync = True
++            return loss, count
++
++        outputs = model(**_model_batch(batch), use_cache=False)
++        logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
++        loss, _ = masked_causal_cross_entropy(logits, batch['labels'])
++        return loss, count
++
++    def _iter_loss_terms(self, model, inputs):
++        """Yield one normalized branch loss at a time.
++
++        The previous implementation summed all 16 branch graphs before
++        returning from compute_loss.  With 200k-token recall rows that kept
++        every activation alive until the final backward and forced
++        save_on_cpu to page the whole logical update.  Yielding terms lets
++        training_step backward and release each graph immediately.
++        """
++        action_batches = inputs['action']
++        recall_batches = inputs['recall']
++        step = int(self.state.global_step) + 1
++        total_steps = int(self.state.max_steps or self.args.max_steps)
++        stage = stage_for_step(step, total_steps, self.args.mem2w_warmup_fraction,
++                               parse_stage_plan(self.args.mem2w_stage_plan))
++
++        # W and C are true alternating stages.  W trains action rows; C
++        # reconstructs recall rows.  The previous implementation computed
++        # both branches in every stage, turning one logical update into 16
++        # long-context forwards and also cycling the 864 recall rows through
++        # the 6804-action epoch.
++        active_action = stage == 'W'
++        active_recall = stage == 'C'
++        action_counts = [self._valid_count(batch) for batch in action_batches] if active_action else []
++        recall_counts = [self._valid_count(batch) for batch in recall_batches] if active_recall else []
++        action_total = self._global_count(sum(action_counts)) if active_action else 0
++        recall_total = self._global_count(sum(recall_counts)) if active_recall else 0
++        if (active_action and action_total <= 0) or (active_recall and recall_total <= 0):
++            raise ValueError(f'Mem2W {stage} stage has zero supervised tokens')
++
++        self._mem2w_manual_grad_sync = False
++        action_metric_sum = 0.0
++        if active_action:
++            for batch, count in zip(action_batches, action_counts):
++                loss, _ = self._forward_branch(model, batch, stop_content_grad=False)
++                term = loss * (float(count) / action_total)
++                action_metric_sum += float(loss.detach().item()) * count
++                if dist.is_available() and dist.is_initialized():
++                    term = term * dist.get_world_size()
++                yield term
++
++        recall_metric_sum = 0.0
++        if active_recall:
++            for batch, count in zip(recall_batches, recall_counts):
++                loss, _ = self._forward_branch(model, batch, stop_content_grad=True)
++                term = loss * (float(count) / recall_total) * float(self.args.mem2w_lambda_recall)
++                recall_metric_sum += float(loss.detach().item()) * count
++                if dist.is_available() and dist.is_initialized():
++                    term = term * dist.get_world_size()
++                yield term
++
++        self._mem2w_last_metrics = {
++            'mem2w/stage': stage,
++            'mem2w/loss_action': action_metric_sum / max(1, sum(action_counts)),
++            'mem2w/loss_recall': recall_metric_sum / max(1, sum(recall_counts)),
++            'mem2w/tokens_action': action_total,
++            'mem2w/tokens_recall': recall_total,
++        }
++ 
++    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
++        loss = None
++        for term in self._iter_loss_terms(model, inputs):
++            loss = term if loss is None else loss + term
++        if loss is None:
++            raise ValueError('Mem2W paired data produced no branch losses')
++        return (loss, None) if return_outputs else loss
++
++    def _sync_manual_memory_grads(self):
++        if not self._mem2w_manual_grad_sync or not dist.is_available() or not dist.is_initialized():
++            return
++        world_size = dist.get_world_size()
++        for parameter in memory_parameters(self._base_model(self.model)):
++            # Do not materialize a zero gradient for a detached C-stage
++            # parameter: AdamW would then apply weight decay/momentum to it.
++            # First agree whether any rank actually produced a gradient.
++            has_grad = torch.tensor([int(parameter.grad is not None)],
++                                    dtype=torch.long, device=self.args.device)
++            dist.all_reduce(has_grad, op=dist.ReduceOp.SUM)
++            if has_grad.item() == 0:
++                continue
++            if parameter.grad is None:
++                parameter.grad = torch.zeros_like(parameter)
++            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
++            parameter.grad.div_(world_size)
++
++    def training_step(self, model, inputs, *args, **kwargs):
++        model.train()
++        inputs = self._prepare_inputs(inputs)
++        context = (torch.autograd.graph.save_on_cpu(pin_memory=False)
++                   if self.args.mem2w_activation_offload else nullcontext())
++        with context:
++            total = None
++            with self.compute_loss_context_manager():
++                for term in self._iter_loss_terms(model, inputs):
++                    self.accelerator.backward(term)
++                    value = term.detach()
++                    total = value if total is None else total + value
++        self._sync_manual_memory_grads()
++        if total is None:
++            raise ValueError('Mem2W paired data produced no branch losses')
++        return total
++
++    def log(self, logs, start_time=None):
++        if self._mem2w_last_metrics:
++            logs = {**logs, **self._mem2w_last_metrics}
++        return super().log(logs, start_time=start_time)
++
++    def _save_model(self, output_dir=None, state_dict=None):
++        if getattr(self.args, 'tuner_type', None) != 'mem2w':
++            return super()._save_model(output_dir, state_dict)
++        output_dir = output_dir or self.args.output_dir
++        output = Path(output_dir)
++        output.mkdir(parents=True, exist_ok=True)
++        model = self._base_model(self.model)
++        Mem2WTuner.save_pretrained(
++            model,
++            str(output),
++            state_dict=state_dict or model.state_dict(),
++            safe_serialization=self.args.safe_serialization,
++        )
+diff --git a/swift/trainers/mixin.py b/swift/trainers/mixin.py
+--- a/swift/trainers/mixin.py
++++ b/swift/trainers/mixin.py
+@@ -68,6 +68,32 @@
+ 
+ class SwiftMixin:
+     FLASH_CKPT_WAIT_TIMEOUT = 1800
++
++    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
++        """Restore native tuners before the standard Trainer state loading.
++
++        Hugging Face Trainer only recognizes full-model and PEFT adapter
++        filenames.  Mem2W deliberately stores its four tensors as
++        ``memory.safetensors``/``memory.pt``; dispatching here keeps normal
++        optimizer, scheduler, and trainer-state restoration intact while
++        avoiding a false "checkpoint has no weights" error.
++        """
++        if getattr(self.args, 'tuner_type', None) == 'mem2w':
++            memory_file = os.path.join(resume_from_checkpoint, 'memory.safetensors')
++            memory_file_pt = os.path.join(resume_from_checkpoint, 'memory.pt')
++            config_file = os.path.join(resume_from_checkpoint, 'mem2w_config.json')
++            if os.path.isfile(memory_file) or os.path.isfile(memory_file_pt):
++                from swift.tuners.mem2w import Mem2WTuner
++
++                target = model if model is not None else self.model
++                target = unwrap_model(target)
++                Mem2WTuner.load_checkpoint(target, resume_from_checkpoint, is_trainable=True)
++                return
++            if os.path.isfile(config_file):
++                raise RuntimeError(
++                    f'Mem2W checkpoint {resume_from_checkpoint!r} has mem2w_config.json '
++                    'but no memory.safetensors or memory.pt')
++        return super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+ 
+     def __init__(self,
+                  model: PreTrainedModel,
+diff --git a/swift/trainers/seq2seq_trainer.py b/swift/trainers/seq2seq_trainer.py
+--- a/swift/trainers/seq2seq_trainer.py
++++ b/swift/trainers/seq2seq_trainer.py
+@@ -14,6 +14,7 @@
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+ 
+ from swift.infer_engine import InferRequest, RequestConfig, TransformersEngine
++from swift.mem2w.dual_trainer import chunked_hidden_cross_entropy
+ from swift.sequence_parallel import sequence_parallel
+ from swift.utils import HfConfigFactory, JsonlWriter, Serializer, gc_collect, get_logger, unwrap_model_for_generation
+ from .arguments import Seq2SeqTrainingArguments
+@@ -107,7 +108,13 @@
+         if self.template.sequence_parallel_size > 1:
+             sequence_parallel.prepare_inputs(inputs)
+ 
+-        use_logits_to_keep = self.get_use_logits_to_keep(self.template.sequence_parallel_size == 1)
++        # A chunked hidden-state loss consumes the complete labels tensor and
++        # computes only small lm_head/CE tiles.  Do not first rewrite labels
++        # into the logits_to_keep suffix; that would change the token frame
++        # used by the chunked objective.
++        chunk_size = int(getattr(self.args, 'sft_loss_chunk_size', 0) or 0)
++        use_logits_to_keep = (False if chunk_size > 0 else
++                              self.get_use_logits_to_keep(self.template.sequence_parallel_size == 1))
+         if use_logits_to_keep:
+             self.prepare_logits_to_keep(inputs)
+ 
+@@ -123,7 +130,77 @@
+         inputs['compute_loss_func'] = self.compute_loss_func
+         return inputs
+ 
++    def _chunked_sft_loss(self, model, inputs, return_outputs=False):
++        """Compute exact causal CE without constructing full vocabulary logits.
++
++        This path is deliberately inside the native Seq2SeqTrainer so LoRA,
++        full tuning, Accelerate/DDP, checkpointing and scheduler handling stay
++        on the regular ms-swift lifecycle.  Only the final hidden-state to
++        lm_head projection is tiled; the full context and all supervised
++        labels remain intact.
++        """
++        chunk_size = int(getattr(self.args, 'sft_loss_chunk_size', 0) or 0)
++        if chunk_size <= 0:
++            raise ValueError('sft_loss_chunk_size must be positive')
++        labels = inputs.pop('labels')
++        ignored = {
++            'compute_loss_func', 'loss_scale', 'text_position_ids', 'channel',
++            'lengths', 'template_inputs', '_extra_kwargs', 'logits_to_keep',
++        }
++        model_inputs = {key: value for key, value in inputs.items() if key not in ignored}
++        unwrapped = self.accelerator.unwrap_model(model)
++        if isinstance(unwrapped, PeftModel):
++            base = unwrapped.get_base_model()
++        else:
++            base = unwrapped
++        if not hasattr(base, 'model') or not hasattr(base, 'get_output_embeddings'):
++            raise ValueError(
++                f'sft_loss_chunk_size requires a causal model exposing model/get_output_embeddings, got {type(base)!r}')
++        outputs = base.model(**model_inputs, use_cache=False)
++        hidden = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.last_hidden_state
++        local_loss, local_count = chunked_hidden_cross_entropy(
++            hidden,
++            base.get_output_embeddings(),
++            labels,
++            chunk_size,
++            labels_are_shifted=self.template.sequence_parallel_size > 1)
++
++        # The model forward intentionally bypasses DDP so it can stop before
++        # the vocabulary projection.  Weight by the global supervised-token
++        # denominator and synchronize trainable gradients in training_step.
++        if dist.is_available() and dist.is_initialized():
++            count_tensor = torch.tensor([local_count], dtype=torch.long, device=local_loss.device)
++            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
++            global_count = int(count_tensor.item())
++            local_loss = local_loss * (float(local_count) / max(1, global_count)) * dist.get_world_size()
++
++        # Accelerate/Trainer expects the scalar loss on the model's input
++        # device.  With ``device_map=auto`` the final hidden state and lm_head
++        # live on the last shard, so explicitly bridge the scalar back to the
++        # first device while preserving its autograd edge.
++        loss = local_loss.to(self.args.device)
++        return (loss, None) if return_outputs else loss
++
++    def _sync_chunked_sft_grads(self):
++        if int(getattr(self.args, 'sft_loss_chunk_size', 0) or 0) <= 0:
++            return
++        if not dist.is_available() or not dist.is_initialized():
++            return
++        model = self.accelerator.unwrap_model(self.model)
++        if isinstance(model, PeftModel):
++            model = model.get_base_model()
++        world_size = dist.get_world_size()
++        for parameter in model.parameters():
++            if not parameter.requires_grad:
++                continue
++            if parameter.grad is None:
++                parameter.grad = torch.zeros_like(parameter)
++            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
++            parameter.grad.div_(world_size)
++
+     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
++        if int(getattr(self.args, 'sft_loss_chunk_size', 0) or 0) > 0:
++            return self._chunked_sft_loss(model, inputs, return_outputs=return_outputs)
+         labels = None
+         compute_loss_func: Callable = inputs.pop('compute_loss_func', None)
+         loss_scale = inputs.pop('loss_scale', None)
+@@ -253,4 +330,6 @@
+ 
+     def training_step(self, model, inputs, *args, **kwargs):
+         with self.template.forward_context(self.model, inputs):
+-            return super().training_step(model, inputs, *args, **kwargs)
++            result = super().training_step(model, inputs, *args, **kwargs)
++        self._sync_chunked_sft_grads()
++        return result
+diff --git a/swift/trainers/trainer_factory.py b/swift/trainers/trainer_factory.py
+--- a/swift/trainers/trainer_factory.py
++++ b/swift/trainers/trainer_factory.py
+@@ -56,6 +56,9 @@
+ 
+     @classmethod
+     def get_trainer_cls(cls, args):
++        if getattr(args, 'tuner_type', None) == 'mem2w':
++            from swift.trainers.mem2w_trainer import Mem2WDualTrainer
++            return Mem2WDualTrainer
+         return cls.get_cls(args, cls.TRAINER_MAPPING)
+ 
+     @classmethod
+diff --git a/swift/tuner_plugin/__init__.py b/swift/tuner_plugin/__init__.py
+--- a/swift/tuner_plugin/__init__.py
++++ b/swift/tuner_plugin/__init__.py
+@@ -1,3 +1,20 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+ from .base import PeftTuner, Tuner
+-from .mapping import tuners_map
++
++
++def __getattr__(name):
++    """Load the tuner registry lazily.
++
++    ``mapping`` imports the concrete tuners, including the native Mem2W tuner.
++    The Mem2W tuner itself needs the base ``Tuner`` class, so importing the
++    registry eagerly here creates a package-initialisation cycle.  Keeping the
++    registry lazy preserves the public ``from swift.tuner_plugin import
++    tuners_map`` API while allowing concrete tuners to import the base safely.
++    """
++    if name == 'tuners_map':
++        from .mapping import tuners_map
++        return tuners_map
++    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
++
++
++__all__ = ['PeftTuner', 'Tuner', 'tuners_map']
+diff --git a/swift/tuner_plugin/mapping.py b/swift/tuner_plugin/mapping.py
+--- a/swift/tuner_plugin/mapping.py
++++ b/swift/tuner_plugin/mapping.py
+@@ -2,9 +2,11 @@
+ from .dummy import DummyTuner
+ from .ia3 import IA3Tuner
+ from .lora_llm import LoRALLMTuner
++from swift.tuners.mem2w import Mem2WTuner
+ 
+ tuners_map = {
+     'ia3': IA3Tuner,
+     'lora_llm': LoRALLMTuner,
+     'dummy': DummyTuner,
++    'mem2w': Mem2WTuner,
+ }
+diff --git a/swift/tuners/mem2w.py b/swift/tuners/mem2w.py
+new file mode 100644
+--- /dev/null
++++ b/swift/tuners/mem2w.py
+@@ -0,0 +1,160 @@
++"""Native ms-swift tuner for the Mem2W persistent memory parameters."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Optional
++
++import torch
++
++from swift.tuner_plugin.base import Tuner
++from swift.mem2w import Mem2WConfig, attach_memory, freeze_memory_only, get_memory_module
++
++
++def _config_from_args(args, model) -> Mem2WConfig:
++    model_config = getattr(model, 'config', None)
++    text_config = getattr(model_config, 'text_config', None)
++    hidden_size = getattr(model_config, 'hidden_size', None) or getattr(text_config, 'hidden_size', None)
++    if hidden_size is None:
++        hidden_size = 4096
++    return Mem2WConfig(
++        hidden_size=int(hidden_size),
++        slots=args.mem2w_slots,
++        key_dim=args.mem2w_key_dim,
++        value_dim=args.mem2w_value_dim,
++        insertion_index=args.mem2w_insertion_index,
++        rms_eps=args.mem2w_rms_eps,
++        memory_dropout=args.mem2w_dropout,
++        stop_content_grad=args.mem2w_stop_content_grad,
++        compute_chunk_size=args.mem2w_compute_chunk_size,
++    )
++
++
++def _normalize_state(state_dict):
++    normalized = {}
++    for key, value in state_dict.items():
++        marker = '._mem2w_memory.'
++        if marker in key:
++            normalized[key.rsplit(marker, 1)[-1]] = value
++        elif key.startswith('_mem2w_memory.'):
++            normalized[key[len('_mem2w_memory.'):]] = value
++        elif key.startswith('memory.'):
++            normalized[key[len('memory.'):]] = value
++        elif key in {'W_Q', 'K', 'V', 'W_O'}:
++            normalized[key] = value
++    return normalized
++
++
++def _materialize_memory_state(model, state_dict):
++    """Extract and validate exactly the four Mem2W tensors.
++
++    ``state_dict`` is supplied by Trainer/Accelerate and may be a sharded or
++    incomplete view under ZeRO/FSDP.  Silently falling back to the local module
++    in that case can save rank-local garbage or stale weights.  We therefore
++    fail closed and require the caller to configure a full-state gather before
++    invoking the tuner save path.
++    """
++    expected = set(get_memory_module(model).state_dict())
++    normalized = _normalize_state(state_dict)
++    missing = expected - set(normalized)
++    extra = set(normalized) - expected
++    if missing or extra:
++        raise RuntimeError(
++            'Mem2W checkpoint requires a complete gathered state dict; '
++            f'missing={sorted(missing)}, unexpected={sorted(extra)}. '
++            'Configure FSDP/DeepSpeed full-state gathering before saving.')
++    memory_state = {}
++    module_state = get_memory_module(model).state_dict()
++    for key in expected:
++        value = normalized[key]
++        if not isinstance(value, torch.Tensor):
++            raise TypeError(f'Mem2W state {key!r} is not a torch.Tensor: {type(value)!r}')
++        if value.is_meta:
++            raise RuntimeError(f'Mem2W state {key!r} is still on the meta device')
++        if tuple(value.shape) != tuple(module_state[key].shape):
++            raise RuntimeError(
++                f'Mem2W state {key!r} has shape {tuple(value.shape)}, '
++                f'expected {tuple(module_state[key].shape)}')
++        memory_state[key] = value.detach().cpu().contiguous()
++    return memory_state
++
++
++class Mem2WTuner(Tuner):
++    """Attach Mem2W before Trainer/Accelerate wrapping and save only its tensors."""
++
++    @staticmethod
++    def prepare_model(args, model):
++        model = attach_memory(model, _config_from_args(args, model))
++        return freeze_memory_only(model)
++
++    @staticmethod
++    def save_pretrained(
++        model: torch.nn.Module,
++        save_directory: str,
++        state_dict: Optional[dict] = None,
++        safe_serialization: bool = True,
++        **kwargs,
++    ) -> None:
++        output = Path(save_directory)
++        output.mkdir(parents=True, exist_ok=True)
++        if state_dict is None:
++            state_dict = model.state_dict()
++        memory_state = _materialize_memory_state(model, state_dict)
++        if safe_serialization:
++            from safetensors.torch import save_file
++
++            save_file(memory_state, str(output / 'memory.safetensors'))
++        else:
++            torch.save(memory_state, output / 'memory.pt')
++        config = getattr(model, '_mem2w_config', None)
++        if config is None:
++            config = Mem2WConfig(
++                hidden_size=get_memory_module(model).hidden_size,
++                slots=get_memory_module(model).slots,
++                key_dim=get_memory_module(model).key_dim,
++                value_dim=get_memory_module(model).value_dim,
++                insertion_index=getattr(model, '_mem2w_insertion_index', 15),
++            )
++        (output / 'mem2w_config.json').write_text(
++            json.dumps(config.__dict__, ensure_ascii=False, indent=2, sort_keys=True) + '\n', encoding='utf-8')
++
++    @staticmethod
++    def from_pretrained(model: torch.nn.Module, model_id: str, **kwargs):
++        checkpoint = Path(model_id)
++        config_path = checkpoint / 'mem2w_config.json'
++        if hasattr(model, '_mem2w_memory') or getattr(model, '_mem2w_memory_layer', None) is not None:
++            memory = get_memory_module(model)
++        else:
++            config = Mem2WConfig.from_json(str(config_path) if config_path.is_file() else None)
++            memory = get_memory_module(attach_memory(model, config))
++        safetensors_path = checkpoint / 'memory.safetensors'
++        if safetensors_path.is_file():
++            from safetensors.torch import load_file
++
++            state = load_file(str(safetensors_path), device='cpu')
++        else:
++            state = torch.load(checkpoint / 'memory.pt', map_location='cpu', weights_only=True)
++        memory_state = _normalize_state(state)
++        expected = set(memory.state_dict())
++        if set(memory_state) != expected:
++            raise RuntimeError(
++                f'Invalid Mem2W checkpoint {checkpoint}: '
++                f'missing={sorted(expected - set(memory_state))}, '
++                f'unexpected={sorted(set(memory_state) - expected)}')
++        memory.load_state_dict(memory_state, strict=True)
++        if kwargs.get('is_trainable', True):
++            return freeze_memory_only(model)
++        model.requires_grad_(False)
++        return model
++
++    @staticmethod
++    def load_checkpoint(model: torch.nn.Module, checkpoint: str, **kwargs) -> torch.nn.Module:
++        """Load a native Mem2W checkpoint during Trainer resume.
++
++        Transformers' generic Trainer loader only knows model/PEFT filenames;
++        Mem2W checkpoints intentionally contain ``memory.safetensors``.  This
++        entry point lets ms-swift's trainer mixin restore the adapter while
++        leaving optimizer/scheduler state to the standard Trainer path.
++        """
++        return Mem2WTuner.from_pretrained(model, checkpoint, **kwargs)
+diff --git a/tests/test_mem2w_chunked_loss.py b/tests/test_mem2w_chunked_loss.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mem2w_chunked_loss.py
+@@ -0,0 +1,27 @@
++import torch
++from swift.mem2w.dual_trainer import chunked_hidden_cross_entropy, masked_causal_cross_entropy
++
++
++def test_chunked_projection_matches_full_sequence_loss_and_gradient():
++    torch.manual_seed(42)
++    head = torch.nn.Linear(7, 23).requires_grad_(False)
++    hidden = torch.randn(2, 17, 7, requires_grad=True)
++    labels = torch.randint(0, 23, (2, 17))
++    labels[:, :5] = -100
++    labels[0, 8:12] = -100
++    expected, n = masked_causal_cross_entropy(head(hidden), labels)
++    expected.backward()
++    gradient = hidden.grad.clone()
++    for chunk_size in (1, 3, 100):
++        candidate = hidden.detach().clone().requires_grad_()
++        actual, m = chunked_hidden_cross_entropy(candidate, head, labels, chunk_size)
++        actual.backward()
++        assert n == m
++        torch.testing.assert_close(actual, expected)
++        torch.testing.assert_close(candidate.grad, gradient)
++    assert all(p.grad is None for p in head.parameters())
++
++
++if __name__ == '__main__':
++    test_chunked_projection_matches_full_sequence_loss_and_gradient()
++    print('chunked CE: value, count, gradients, frozen head PASSED', flush=True)
+diff --git a/tests/test_mem2w_memory_tiling.py b/tests/test_mem2w_memory_tiling.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mem2w_memory_tiling.py
+@@ -0,0 +1,38 @@
++import copy
++
++import torch
++
++from swift.mem2w.config import Mem2WConfig
++from swift.mem2w.memory import PersistentKVMemory
++
++
++def test_memory_tiling():
++    for stop_content in (False, True):
++        torch.manual_seed(18)
++        full = PersistentKVMemory(Mem2WConfig(hidden_size=8, slots=5, key_dim=4,
++                                              value_dim=6, compute_chunk_size=100)).double()
++        # Nonzero output matrix is essential: zero initialization hides Q/K/V bugs.
++        with torch.no_grad():
++            full.W_O.normal_()
++        tiled = copy.deepcopy(full)
++        tiled.compute_chunk_size = 3
++        x = torch.randn(2, 11, 8, dtype=torch.double, requires_grad=True)
++        y = x.detach().clone().requires_grad_()
++        mask = torch.ones(2, 11)
++        mask[0, -2:] = 0
++        a = full(x, attention_mask=mask, stop_content_grad=stop_content)
++        b = tiled(y, attention_mask=mask, stop_content_grad=stop_content)
++        torch.testing.assert_close(a, b)
++        a.square().mean().backward()
++        b.square().mean().backward()
++        torch.testing.assert_close(x.grad, y.grad)
++        for (name, p), (_, q) in zip(full.named_parameters(), tiled.named_parameters()):
++            if stop_content and name in {'V', 'W_O'}:
++                assert p.grad is None and q.grad is None
++            else:
++                torch.testing.assert_close(p.grad, q.grad)
++    print('memory tiling: values, input/four-parameter gradients, C detach PASSED', flush=True)
++
++
++if __name__ == '__main__':
++    test_memory_tiling()
+diff --git a/tests/test_mem2w_native.py b/tests/test_mem2w_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mem2w_native.py
+@@ -0,0 +1,40 @@
++import pytest
++
++torch = pytest.importorskip('torch')
++from torch import nn
++
++from swift.mem2w import Mem2WConfig, attach_memory, freeze_memory_only, get_memory_module
++from swift.tuner_plugin.mapping import tuners_map
++
++
++class _Block(nn.Module):
++    def __init__(self, hidden_size):
++        super().__init__()
++        self.proj = nn.Linear(hidden_size, hidden_size)
++
++    def forward(self, hidden_states, **kwargs):
++        return (self.proj(hidden_states), 'cache')
++
++
++class _TinyQwen(nn.Module):
++    def __init__(self, hidden_size=8):
++        super().__init__()
++        self.model = nn.Module()
++        self.model.layers = nn.ModuleList([_Block(hidden_size) for _ in range(16)])
++        self.config = type('Config', (), {'hidden_size': hidden_size})()
++
++
++def test_mem2w_is_a_native_tuner_and_preserves_layer_shape():
++    assert 'mem2w' in tuners_map
++    model = _TinyQwen()
++    attach_memory(model, Mem2WConfig(hidden_size=8, insertion_index=15, slots=4, key_dim=3, value_dim=3))
++    assert len(model.model.layers) == 16
++    freeze_memory_only(model)
++    trainable = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
++    assert len(trainable) == 4
++    hidden = torch.randn(2, 5, 8)
++    layer = model.model.layers[15]
++    layer._mem2w_enabled = False
++    bypass = layer(hidden)[0]
++    assert torch.equal(bypass, layer.proj(hidden))
++    assert get_memory_module(model).W_Q.shape == (8, 3)
