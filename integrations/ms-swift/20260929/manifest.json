@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-09-30T02:59:36.661415+00:00",
+  "captured_at_utc": "2026-09-30T06:28:10.901121+00:00",
   "upstream": "https://github.com/modelscope/ms-swift",
   "base_commit": "c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c",
   "source": "A800 /home/sht/haoting/ms-swift-mem2w (disk snapshot; not a Git repository)",
@@ -78,8 +78,8 @@
     {
       "path": "swift/cli/mem2w_sft.py",
       "status": "A",
-      "bytes": 16112,
-      "sha256": "804943fc7ad3c7e5dab8ae691f866c7db155fc409fb853ec622e26e424a2e0f4",
+      "bytes": 16138,
+      "sha256": "0821c96677642c984b700b464ff368555e5ceeaadce29fe9e6c9483854a3d52d",
       "upstream_sha256": null
     },
     {
@@ -99,8 +99,8 @@
     {
       "path": "swift/mem2w/dual_trainer.py",
       "status": "A",
-      "bytes": 22127,
-      "sha256": "f368fd61a108cb51ae6bbff6cee13fdbb72e8ee8310307cef6fdcefa1b5a9f80",
+      "bytes": 23415,
+      "sha256": "42f9b6c0de8fae5ddbe27df4e015336bba7f2b28ad90dcecaffeba826c0740b1",
       "upstream_sha256": null
     },
     {
@@ -204,8 +204,8 @@
     {
       "path": "tests/test_mem2w_native.py",
       "status": "A",
-      "bytes": 1413,
-      "sha256": "18e65d1ab62e7bb3de97b5ee51a582ff3cb3adf7b0962acb66d6f1f62d616bc1",
+      "bytes": 2055,
+      "sha256": "4024155ee4ec96130a12670ac16feaa56dce61c9c716839076416948b1bb23d8",
       "upstream_sha256": null
     }
   ],

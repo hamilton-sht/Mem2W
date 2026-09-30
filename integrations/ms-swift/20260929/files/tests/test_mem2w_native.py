@@ -4,6 +4,7 @@ torch = pytest.importorskip('torch')
 from torch import nn
 
 from swift.mem2w import Mem2WConfig, attach_memory, freeze_memory_only, get_memory_module
+from swift.mem2w.dual_trainer import Mem2WDualObjectiveTrainer
 from swift.tuner_plugin.mapping import tuners_map
 
 
@@ -38,3 +39,17 @@ def test_mem2w_is_a_native_tuner_and_preserves_layer_shape():
     bypass = layer(hidden)[0]
     assert torch.equal(bypass, layer.proj(hidden))
     assert get_memory_module(model).W_Q.shape == (8, 3)
+
+
+def test_c_stage_clears_content_gradients_before_adamw():
+    model = _TinyQwen()
+    attach_memory(model, Mem2WConfig(hidden_size=8, insertion_index=15, slots=4, key_dim=3, value_dim=3))
+    memory = freeze_memory_only(model)
+    module = get_memory_module(memory)
+    for parameter in module.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    Mem2WDualObjectiveTrainer._clear_stage_frozen_gradients(memory, 'C')
+    assert module.W_Q.grad is not None
+    assert module.K.grad is not None
+    assert module.V.grad is None
+    assert module.W_O.grad is None

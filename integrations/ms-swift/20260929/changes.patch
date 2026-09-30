@@ -461,7 +461,7 @@ diff --git a/swift/cli/mem2w_sft.py b/swift/cli/mem2w_sft.py
 new file mode 100644
 --- /dev/null
 +++ b/swift/cli/mem2w_sft.py
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,328 @@
 +"""Native ms-swift paired Mem2W action/recall training entry point."""
 +
 +from __future__ import annotations
@@ -680,6 +680,7 @@ new file mode 100644
 +    optimizer = torch.optim.AdamW(
 +        [parameter for parameter in model.parameters() if parameter.requires_grad],
 +        lr=ns.learning_rate,
++        weight_decay=0.0,
 +    )
 +    warmup_steps = max(1, math.ceil(ns.lr_warmup_fraction * total_updates))
 +
@@ -876,7 +877,7 @@ diff --git a/swift/mem2w/dual_trainer.py b/swift/mem2w/dual_trainer.py
 new file mode 100644
 --- /dev/null
 +++ b/swift/mem2w/dual_trainer.py
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,467 @@
 +"""Paired action/recall Mem2W training on top of ms-swift templates.
 +
 +This module intentionally stays below the public ``swift sft`` path.  The
@@ -911,7 +912,7 @@ new file mode 100644
 +from torch.utils.checkpoint import checkpoint
 +from contextlib import nullcontext
 +
-+from .integration import memory_parameters, set_stop_content_grad
++from .integration import get_memory_module, memory_parameters, set_stop_content_grad
 +
 +
 +@dataclass(frozen=True)
@@ -1222,6 +1223,24 @@ new file mode 100644
 +            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
 +            parameter.grad = gradient / world_size
 +
++    @staticmethod
++    def _clear_stage_frozen_gradients(model: Any, stage: str) -> None:
++        """Keep C-stage content tensors out of AdamW's update path.
++
++        ``V`` and ``W_O`` are detached in the recall forward, but the explicit
++        distributed synchronizer materializes missing gradients as zeros so
++        collective participation stays symmetric.  A zero tensor is still a
++        valid AdamW gradient: it can apply stale momentum and decoupled weight
++        decay.  Restoring ``None`` after the collective makes the optimizer
++        skip these parameters completely, including their old optimizer state.
++        """
++        if stage != 'C':
++            return
++        memory = get_memory_module(model)
++        for name in ('V', 'W_O'):
++            parameter = getattr(memory, name)
++            parameter.grad = None
++
 +    def train_step(self, update_index: int) -> dict[str, Any]:
 +        started = time.monotonic()
 +        if self.device.type == 'cuda':
@@ -1269,6 +1288,7 @@ new file mode 100644
 +
 +        parameters = memory_parameters(self.model)
 +        self._synchronize_gradients(parameters)
++        self._clear_stage_frozen_gradients(self.model, stage)
 +        gradients = [parameter for parameter in parameters if parameter.grad is not None]
 +        if not gradients:
 +            raise RuntimeError('no Mem2W parameter received a gradient')
@@ -1290,6 +1310,11 @@ new file mode 100644
 +                      for name, parameter in self.model.named_parameters() if parameter.requires_grad}
 +        before = [parameter.detach().clone() for parameter in parameters]
 +        self.optimizer.step()
++        if stage == 'C':
++            content_ids = {id(getattr(get_memory_module(self.model), name)) for name in ('V', 'W_O')}
++            for parameter, initial in zip(parameters, before):
++                if id(parameter) in content_ids and not torch.equal(parameter, initial):
++                    raise RuntimeError('C stage changed detached Mem2W content parameters')
 +        deltas = [float((parameter.detach().float() - initial.float()).norm().item())
 +                  for parameter, initial in zip(parameters, before)]
 +        if self.scheduler is not None:
@@ -2580,13 +2605,14 @@ diff --git a/tests/test_mem2w_native.py b/tests/test_mem2w_native.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_mem2w_native.py
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,55 @@
 +import pytest
 +
 +torch = pytest.importorskip('torch')
 +from torch import nn
 +
 +from swift.mem2w import Mem2WConfig, attach_memory, freeze_memory_only, get_memory_module
++from swift.mem2w.dual_trainer import Mem2WDualObjectiveTrainer
 +from swift.tuner_plugin.mapping import tuners_map
 +
 +
@@ -2621,3 +2647,17 @@ new file mode 100644
 +    bypass = layer(hidden)[0]
 +    assert torch.equal(bypass, layer.proj(hidden))
 +    assert get_memory_module(model).W_Q.shape == (8, 3)
++
++
++def test_c_stage_clears_content_gradients_before_adamw():
++    model = _TinyQwen()
++    attach_memory(model, Mem2WConfig(hidden_size=8, insertion_index=15, slots=4, key_dim=3, value_dim=3))
++    memory = freeze_memory_only(model)
++    module = get_memory_module(memory)
++    for parameter in module.parameters():
++        parameter.grad = torch.ones_like(parameter)
++    Mem2WDualObjectiveTrainer._clear_stage_frozen_gradients(memory, 'C')
++    assert module.W_Q.grad is not None
++    assert module.K.grad is not None
++    assert module.V.grad is None
++    assert module.W_O.grad is None

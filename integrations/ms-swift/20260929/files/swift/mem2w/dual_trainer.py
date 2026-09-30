@@ -32,7 +32,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from contextlib import nullcontext
 
-from .integration import memory_parameters, set_stop_content_grad
+from .integration import get_memory_module, memory_parameters, set_stop_content_grad
 
 
 @dataclass(frozen=True)
@@ -343,6 +343,24 @@ class Mem2WDualObjectiveTrainer:
             dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
             parameter.grad = gradient / world_size
 
+    @staticmethod
+    def _clear_stage_frozen_gradients(model: Any, stage: str) -> None:
+        """Keep C-stage content tensors out of AdamW's update path.
+
+        ``V`` and ``W_O`` are detached in the recall forward, but the explicit
+        distributed synchronizer materializes missing gradients as zeros so
+        collective participation stays symmetric.  A zero tensor is still a
+        valid AdamW gradient: it can apply stale momentum and decoupled weight
+        decay.  Restoring ``None`` after the collective makes the optimizer
+        skip these parameters completely, including their old optimizer state.
+        """
+        if stage != 'C':
+            return
+        memory = get_memory_module(model)
+        for name in ('V', 'W_O'):
+            parameter = getattr(memory, name)
+            parameter.grad = None
+
     def train_step(self, update_index: int) -> dict[str, Any]:
         started = time.monotonic()
         if self.device.type == 'cuda':
@@ -390,6 +408,7 @@ class Mem2WDualObjectiveTrainer:
 
         parameters = memory_parameters(self.model)
         self._synchronize_gradients(parameters)
+        self._clear_stage_frozen_gradients(self.model, stage)
         gradients = [parameter for parameter in parameters if parameter.grad is not None]
         if not gradients:
             raise RuntimeError('no Mem2W parameter received a gradient')
@@ -411,6 +430,11 @@ class Mem2WDualObjectiveTrainer:
                       for name, parameter in self.model.named_parameters() if parameter.requires_grad}
         before = [parameter.detach().clone() for parameter in parameters]
         self.optimizer.step()
+        if stage == 'C':
+            content_ids = {id(getattr(get_memory_module(self.model), name)) for name in ('V', 'W_O')}
+            for parameter, initial in zip(parameters, before):
+                if id(parameter) in content_ids and not torch.equal(parameter, initial):
+                    raise RuntimeError('C stage changed detached Mem2W content parameters')
         deltas = [float((parameter.detach().float() - initial.float()).norm().item())
                   for parameter, initial in zip(parameters, before)]
         if self.scheduler is not None:

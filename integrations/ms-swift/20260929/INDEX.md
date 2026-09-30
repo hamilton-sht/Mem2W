@@ -25,13 +25,13 @@ Base: `c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c`
 
 | M | [swift/cli/main.py](files/swift/cli/main.py) | 107 |
 
-| A | [swift/cli/mem2w_sft.py](files/swift/cli/mem2w_sft.py) | 327 |
+| A | [swift/cli/mem2w_sft.py](files/swift/cli/mem2w_sft.py) | 328 |
 
 | A | [swift/mem2w/__init__.py](files/swift/mem2w/__init__.py) | 10 |
 
 | A | [swift/mem2w/config.py](files/swift/mem2w/config.py) | 63 |
 
-| A | [swift/mem2w/dual_trainer.py](files/swift/mem2w/dual_trainer.py) | 443 |
+| A | [swift/mem2w/dual_trainer.py](files/swift/mem2w/dual_trainer.py) | 467 |
 
 | A | [swift/mem2w/integration.py](files/swift/mem2w/integration.py) | 200 |
 
@@ -61,4 +61,4 @@ Base: `c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c`
 
 | A | [tests/test_mem2w_memory_tiling.py](files/tests/test_mem2w_memory_tiling.py) | 38 |
 
-| A | [tests/test_mem2w_native.py](files/tests/test_mem2w_native.py) | 40 |
+| A | [tests/test_mem2w_native.py](files/tests/test_mem2w_native.py) | 55 |

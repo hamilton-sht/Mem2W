@@ -216,6 +216,7 @@ def run(ns: argparse.Namespace) -> dict:
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=ns.learning_rate,
+        weight_decay=0.0,
     )
     warmup_steps = max(1, math.ceil(ns.lr_warmup_fraction * total_updates))
 
