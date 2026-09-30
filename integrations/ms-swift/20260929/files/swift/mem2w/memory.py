@@ -39,6 +39,8 @@ class PersistentKVMemory(nn.Module):
             return hidden_states
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.hidden_size:
             raise ValueError('memory expects hidden states with shape [batch, sequence, hidden_size]')
+        if hidden_states.shape[1] == 0:
+            raise ValueError('memory does not support empty sequences')
         work_dtype = torch.float32 if hidden_states.dtype in (torch.float16, torch.bfloat16) else hidden_states.dtype
         keys = self.K.to(work_dtype)
         values = self.V.detach().to(work_dtype) if stop_content_grad else self.V.to(work_dtype)

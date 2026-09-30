@@ -18,19 +18,19 @@ checkpoint serialization are still provided by ms-swift itself.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
-import copy
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from contextlib import nullcontext
 
 from .integration import get_memory_module, memory_parameters, set_stop_content_grad
 
@@ -68,6 +68,54 @@ class Mem2WDualConfig:
                     raise ValueError(f'unknown Mem2W stage: {stage!r}')
                 if int(updates) <= 0:
                     raise ValueError('stage_plan update counts must be positive')
+
+
+def parse_stage_plan(value: str | None) -> tuple[tuple[str, int], ...] | None:
+    """Parse the shared W/C schedule used by both Mem2W trainers."""
+    if value is None or not str(value).strip():
+        return None
+    result = []
+    for item in str(value).split(','):
+        stage, separator, count = item.strip().partition(':')
+        if separator != ':' or stage not in {'W', 'C'}:
+            raise ValueError('Mem2W stage-plan entries must use W:<updates> or C:<updates>')
+        try:
+            updates = int(count)
+        except ValueError as exc:
+            raise ValueError(f'invalid Mem2W stage-plan update count: {count!r}') from exc
+        if updates <= 0:
+            raise ValueError('Mem2W stage-plan update counts must be positive')
+        result.append((stage, updates))
+    return tuple(result)
+
+
+def stage_for_step(step: int, total_steps: int, warmup_fraction: float,
+                   stage_plan: tuple[tuple[str, int], ...] | None) -> str:
+    """Return the one-based global-step stage for the native Trainer path."""
+    if step < 1 or total_steps < 1:
+        raise ValueError('Mem2W steps are one-based and total_steps must be positive')
+    if stage_plan is not None:
+        consumed = 0
+        for stage, count in stage_plan:
+            consumed += int(count)
+            if step <= consumed:
+                return stage
+        raise ValueError(f'Mem2W step {step} exceeds explicit stage plan of {consumed} steps')
+    return 'W' if step <= math.floor(warmup_fraction * total_steps) else 'C'
+
+
+def stage_and_local_update(update_index: int, total_steps: int, warmup_fraction: float,
+                           stage_plan: tuple[tuple[str, int], ...] | None) -> tuple[str, int]:
+    """Return stage and one-based cursor within that stage."""
+    if stage_plan is None:
+        return stage_for_step(update_index, total_steps, warmup_fraction, None), update_index
+    consumed = 0
+    for stage, updates in stage_plan:
+        updates = int(updates)
+        if update_index <= consumed + updates:
+            return stage, update_index - consumed
+        consumed += updates
+    raise ValueError(f'Mem2W step {update_index} exceeds explicit stage plan of {consumed} steps')
 
 
 def chunked_hidden_cross_entropy(hidden, lm_head, labels, chunk_size, *, labels_are_shifted=False):
@@ -137,17 +185,7 @@ class _EncodedRows(Sequence):
 
 def objective_stage(update_index: int, total_updates: int, warmup_fraction: float,
                     stage_plan: tuple[tuple[str, int], ...] | None = None) -> str:
-    if update_index < 1 or total_updates < 1:
-        raise ValueError('update indices are one-based and total_updates must be positive')
-    if stage_plan is not None:
-        consumed = 0
-        for stage, updates in stage_plan:
-            consumed += int(updates)
-            if update_index <= consumed:
-                return stage
-        raise ValueError(
-            f'update_index {update_index} exceeds explicit stage plan of {consumed} updates')
-    return 'W' if update_index <= math.floor(warmup_fraction * total_updates) else 'C'
+    return stage_for_step(update_index, total_updates, warmup_fraction, stage_plan)
 
 
 def masked_causal_cross_entropy(logits: torch.Tensor,
@@ -157,8 +195,8 @@ def masked_causal_cross_entropy(logits: torch.Tensor,
                                 labels_are_shifted: bool = False) -> tuple[torch.Tensor, int]:
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError(f'expected logits [B,L,V] and labels [B,L], got {tuple(logits.shape)} and {tuple(labels.shape)}')
-    if labels.shape[1] < 2:
-        raise ValueError('causal loss needs at least two sequence positions')
+    if labels.shape[1] < (1 if labels_are_shifted else 2):
+        raise ValueError('causal loss needs at least two unshifted or one shifted sequence position')
     labels = labels.to(logits.device)
     if labels_are_shifted:
         shifted_logits = logits.contiguous()
@@ -237,13 +275,27 @@ class Mem2WDualObjectiveTrainer:
 
     def _batch(self, encoded: Sequence[Mapping[str, Any]], index: int) -> dict[str, Any]:
         row = encoded[index % len(encoded)]
-        batch = self.template.data_collator([dict(row)])
-        batch = _to_device(batch, self.device)
-        # Sequence-parallel preparation is deliberately deferred until the
-        # branch is about to run. The native helper stores full position ids
-        # in process-global state; preparing action and recall batches up front
-        # would let the later branch overwrite the earlier one's lengths.
+        return self.template.data_collator([dict(row)])
+
+    def _prepared_batch(self, encoded: Sequence[Mapping[str, Any]], index: int) -> dict[str, Any]:
+        """Materialize only one batch on device and prepare it immediately."""
+        batch = _to_device(self._batch(encoded, index), self.device)
+        if self.config.sequence_parallel_size > 1:
+            from swift.sequence_parallel import sequence_parallel
+            # The helper stores per-batch position metadata globally. Prepare
+            # and consume one row at a time so action/recall rows cannot
+            # overwrite one another before their forward pass.
+            sequence_parallel.prepare_inputs(batch)
         return batch
+
+    def _branch_counts(self, encoded: Sequence[Mapping[str, Any]], base_index: int) -> list[int]:
+        """Count prepared branch tokens without retaining device batches."""
+        counts = []
+        for offset in range(self.accumulation_steps):
+            batch = self._prepared_batch(encoded, base_index + offset)
+            counts.append(self._valid_token_count(batch))
+            del batch
+        return counts
 
     def _stage_and_local_update(self, update_index: int) -> tuple[str, int]:
         """Return the active objective and its one-based update within that stage.
@@ -252,23 +304,19 @@ class Mem2WDualObjectiveTrainer:
         row cursor at each boundary is therefore required; using the global
         update index would skip the first rows of every later stage.
         """
-        plan = self.config.stage_plan
-        if plan is None:
-            return objective_stage(update_index, self.total_updates,
-                                   self.config.warmup_fraction, None), update_index
-        consumed = 0
-        for stage, updates in plan:
-            updates = int(updates)
-            if update_index <= consumed + updates:
-                return stage, update_index - consumed
-            consumed += updates
-        raise ValueError(f'update_index {update_index} exceeds explicit stage plan of {consumed} updates')
+        return stage_and_local_update(update_index, self.total_updates,
+                                      self.config.warmup_fraction, self.config.stage_plan)
 
     def _valid_token_count(self, batch: Mapping[str, Any]) -> int:
         labels = batch.get('labels')
-        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < 2:
+        minimum_length = 1 if self.config.sequence_parallel_size > 1 else 2
+        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < minimum_length:
             raise ValueError('paired causal batches must contain labels with shape [B,L]')
-        count = int(labels[:, 1:].ne(-100).sum().item())
+        # sequence_parallel.prepare_inputs rolls labels by one position before
+        # sharding.  Once prepared, every local position is already paired with
+        # its next-token target; slicing [:, 1:] again drops a real target.
+        supervised = labels if self.config.sequence_parallel_size > 1 else labels[:, 1:]
+        count = int(supervised.ne(-100).sum().item())
         if count == 0 and self.config.sequence_parallel_size <= 1:
             raise ValueError('paired branch has zero supervised tokens')
         return count
@@ -326,22 +374,24 @@ class Mem2WDualObjectiveTrainer:
 
     @staticmethod
     def _synchronize_gradients(parameters: Sequence[torch.nn.Parameter]) -> None:
-        """Average the four memory gradients when launched under torchrun.
+        """Sum the four memory gradients when launched under torchrun.
 
         The paired trainer deliberately does not wrap the frozen Qwen backbone
         in ``DistributedDataParallel``: only the attached Mem2W tensors are
         trainable, and the native hook-based model path must remain unchanged.
-        Each rank therefore performs the small explicit all-reduce here.
+        Each rank therefore performs the small explicit all-reduce here.  The
+        branch loss is already weighted by the global supervised-token
+        denominator, so averaging this sum again would divide the true global
+        gradient by ``world_size`` a second time.
         """
         if not dist.is_available() or not dist.is_initialized():
             return
-        world_size = dist.get_world_size()
         for parameter in parameters:
             gradient = parameter.grad
             if gradient is None:
                 gradient = torch.zeros_like(parameter)
             dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-            parameter.grad = gradient / world_size
+            parameter.grad = gradient
 
     @staticmethod
     def _clear_stage_frozen_gradients(model: Any, stage: str) -> None:
@@ -371,37 +421,33 @@ class Mem2WDualObjectiveTrainer:
 
         base_index = (stage_update - 1) * self.accumulation_steps
         if stage == 'W':
-            action_batches = [self._batch(self.action_encoded, base_index + offset)
-                              for offset in range(self.accumulation_steps)]
-            action_counts = [self._valid_token_count(batch) for batch in action_batches]
+            action_counts = self._branch_counts(self.action_encoded, base_index)
             action_tokens = self._global_count(sum(action_counts))
-            recall_batches, recall_counts, recall_tokens = [], [], 0
+            recall_counts, recall_tokens = [], 0
         else:
-            recall_batches = [self._batch(self.recall_encoded, base_index + offset)
-                              for offset in range(self.accumulation_steps)]
-            recall_counts = [self._valid_token_count(batch) for batch in recall_batches]
+            recall_counts = self._branch_counts(self.recall_encoded, base_index)
             recall_tokens = self._global_count(sum(recall_counts))
-            action_batches, action_counts, action_tokens = [], [], 0
+            action_counts, action_tokens = [], 0
         if (stage == 'W' and action_tokens == 0) or (stage == 'C' and recall_tokens == 0):
             raise ValueError(f'{stage} stage has zero supervised tokens across sequence-parallel ranks')
         action_loss_sum = 0.0
-        for batch, count in zip(action_batches, action_counts):
-            if self.config.sequence_parallel_size > 1:
-                from swift.sequence_parallel import sequence_parallel
-                sequence_parallel.prepare_inputs(batch)
-            action_loss, _ = self._backward_loss(
-                batch, stop_content_grad=False, weight=count / action_tokens)
-            action_loss_sum += action_loss * count
+        if stage == 'W':
+            for offset, count in enumerate(action_counts):
+                batch = self._prepared_batch(self.action_encoded, base_index + offset)
+                action_loss, _ = self._backward_loss(
+                    batch, stop_content_grad=False, weight=count / action_tokens)
+                del batch
+                action_loss_sum += action_loss * count
         recall_loss_sum = 0.0
-        for batch, count in zip(recall_batches, recall_counts):
-            if self.config.sequence_parallel_size > 1:
-                from swift.sequence_parallel import sequence_parallel
-                sequence_parallel.prepare_inputs(batch)
-            recall_loss, _ = self._backward_loss(
-                batch,
-                stop_content_grad=(stage == 'C'),
-                weight=self.config.lambda_recall * count / recall_tokens)
-            recall_loss_sum += recall_loss * count
+        if stage == 'C':
+            for offset, count in enumerate(recall_counts):
+                batch = self._prepared_batch(self.recall_encoded, base_index + offset)
+                recall_loss, _ = self._backward_loss(
+                    batch,
+                    stop_content_grad=True,
+                    weight=self.config.lambda_recall * count / recall_tokens)
+                del batch
+                recall_loss_sum += recall_loss * count
 
         action_loss_sum = self._global_loss_sum(action_loss_sum)
         recall_loss_sum = self._global_loss_sum(recall_loss_sum)
@@ -455,6 +501,7 @@ class Mem2WDualObjectiveTrainer:
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    """Read object-per-line JSONL, allowing blank lines and ``#`` comments."""
     rows = []
     with Path(path).expanduser().open('r', encoding='utf-8') as stream:
         for line_no, line in enumerate(stream, 1):

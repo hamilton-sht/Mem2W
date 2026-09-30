@@ -22,6 +22,17 @@ def test_chunked_projection_matches_full_sequence_loss_and_gradient():
     assert all(p.grad is None for p in head.parameters())
 
 
+def test_shifted_loss_counts_every_local_target():
+    logits = torch.zeros(1, 4, 5, requires_grad=True)
+    labels = torch.tensor([[3, 1, 2, -100]])
+    _loss, count = masked_causal_cross_entropy(logits, labels, labels_are_shifted=True)
+    assert count == 3
+    _loss, count = chunked_hidden_cross_entropy(
+        logits.detach(), torch.nn.Linear(5, 5, bias=False), labels, 2, labels_are_shifted=True)
+    assert count == 3
+
+
 if __name__ == '__main__':
     test_chunked_projection_matches_full_sequence_loss_and_gradient()
+    test_shifted_loss_counts_every_local_target()
     print('chunked CE: value, count, gradients, frozen head PASSED', flush=True)

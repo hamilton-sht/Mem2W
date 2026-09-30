@@ -27,5 +27,9 @@ FSDP/DeepSpeed wrapping, layer indices and state-dict ownership remain native.
 The trainer's existing tuner save path writes a memory-only checkpoint.
 
 The standard ms-swift causal-LM loss and message-level `loss` masks are used;
-no upstream Trainer or chat-template fork is needed. This first integration
-does not yet implement the later paired action/recall W/C schedule.
+no upstream Trainer or chat-template fork is needed.  Paired W/C training is
+available through the native `mem2w` pipeline with an action stream,
+`--mem2w_recall_dataset`, `--mem2w_stage_plan W:851,C:108,W:851`, and
+`--mem2w_accumulation_steps`.  The separate `mem2w-sft` entry point is the
+lossless custom loop used for sequence-parallel smoke tests and explicit
+stage-local cursors.

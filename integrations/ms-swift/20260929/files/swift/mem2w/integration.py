@@ -140,8 +140,11 @@ def attach_memory(model, config: Optional[Mem2WConfig] = None):
     reference = next(layer.parameters(), None)
     memory = PersistentKVMemory(config)
     if reference is not None:
-        dtype = reference.dtype if reference.is_floating_point() else torch.float32
-        memory.to(device=reference.device, dtype=dtype)
+        # Keep the four persistent tensors in FP32 as the optimizer/master
+        # representation.  ``PersistentKVMemory.forward`` already casts its
+        # matmul work to the model dtype where appropriate; storing BF16 here
+        # would make AdamW updates and checkpoint round-trips BF16 as well.
+        memory.to(device=reference.device, dtype=torch.float32)
     layer.add_module('_mem2w_memory', memory)
     layer._mem2w_enabled = True
     layer._mem2w_stop_content_grad = bool(config.stop_content_grad)
@@ -156,15 +159,7 @@ def attach_memory(model, config: Optional[Mem2WConfig] = None):
 
 
 def get_memory_module(model):
-    layer = getattr(model, '_mem2w_memory_layer', None)
-    if layer is None:
-        for candidate in _decoder_layers(model):
-            if hasattr(candidate, '_mem2w_memory'):
-                layer = candidate
-                break
-    if layer is None:
-        raise ValueError('model has no attached Mem2W memory')
-    return layer._mem2w_memory
+    return _memory_layer(model)._mem2w_memory
 
 
 def _memory_layer(model):

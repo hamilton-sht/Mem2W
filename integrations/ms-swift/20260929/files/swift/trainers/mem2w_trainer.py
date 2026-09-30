@@ -10,19 +10,19 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from contextlib import nullcontext
 
-from transformers import Trainer as HfTrainer, TrainerCallback
+from transformers import TrainerCallback
 from transformers.modeling_utils import unwrap_model
 
 from swift.mem2w.dual_trainer import (chunked_hidden_cross_entropy, masked_causal_cross_entropy,
-                                      _model_batch)
-from swift.mem2w.integration import memory_parameters, set_stop_content_grad
+                                      parse_stage_plan, stage_for_step, _model_batch)
+from swift.mem2w.integration import get_memory_module, memory_parameters, set_stop_content_grad
 from swift.tuners.mem2w import Mem2WTuner
 from .seq2seq_trainer import Seq2SeqTrainer
 
@@ -41,10 +41,17 @@ class Mem2WDualDataset(Sequence):
 
     def __len__(self):
         logical_updates = math.ceil(max(len(self.action_dataset), len(self.recall_dataset)) / self.group_size)
-        # Swift's distributed batch sampler expects a length divisible by the
-        # data-parallel world size.  Padding here repeats the last logical
-        # pair; the modulo indexing in __getitem__ keeps the branch aligned.
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        # Sequence parallel ranks share one data sample.  Only the data-parallel
+        # mesh needs sampler padding; using the global world size here would
+        # shorten/duplicate the dataset when SP > 1.
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            try:
+                from swift.sequence_parallel import sequence_parallel
+                world_size = (int(sequence_parallel.dp_world_size or 1)
+                              if sequence_parallel.enabled() else dist.get_world_size())
+            except (ImportError, AttributeError):
+                world_size = dist.get_world_size()
         return math.ceil(logical_updates / world_size) * world_size
 
     def __getitem__(self, index):
@@ -53,34 +60,10 @@ class Mem2WDualDataset(Sequence):
                   for offset in range(self.group_size)]
         recall = [self.recall_dataset[(start + offset) % len(self.recall_dataset)]
                   for offset in range(self.group_size)]
-        return {'action': action, 'recall': recall}
-
-
-def parse_stage_plan(value: str | None) -> tuple[tuple[str, int], ...] | None:
-    if value is None or not str(value).strip():
-        return None
-    result = []
-    for item in str(value).split(','):
-        stage, separator, count = item.strip().partition(':')
-        if separator != ':' or stage not in {'W', 'C'}:
-            raise ValueError('mem2w_stage_plan entries must use W:<updates> or C:<updates>')
-        count = int(count)
-        if count <= 0:
-            raise ValueError('mem2w_stage_plan update counts must be positive')
-        result.append((stage, count))
-    return tuple(result)
-
-
-def stage_for_step(step: int, total_steps: int, warmup_fraction: float,
-                   stage_plan: tuple[tuple[str, int], ...] | None) -> str:
-    if stage_plan is not None:
-        consumed = 0
-        for stage, count in stage_plan:
-            consumed += count
-            if step <= consumed:
-                return stage
-        raise ValueError(f'Mem2W step {step} exceeds explicit stage plan of {consumed} steps')
-    return 'W' if step <= math.floor(warmup_fraction * total_steps) else 'C'
+        # Keep raw rows in the envelope.  The collator below encodes only the
+        # active branch, avoiding long recall/action tokenization for inactive
+        # stages and avoiding GPU tensors in the dataset object.
+        return {'action_rows': action, 'recall_rows': recall}
 
 
 def _prepare_nested(value, device):
@@ -127,11 +110,11 @@ class Mem2WDualTrainer(Seq2SeqTrainer):
 
     def _get_data_collator(self, args, template):
         def collate(features):
-            action_rows = [row for feature in features for row in feature['action']]
-            recall_rows = [row for feature in features for row in feature['recall']]
+            action_rows = [row for feature in features for row in feature['action_rows']]
+            recall_rows = [row for feature in features for row in feature['recall_rows']]
             return {
-                'action': [template.data_collator([dict(row)]) for row in action_rows],
-                'recall': [template.data_collator([dict(row)]) for row in recall_rows],
+                'action_rows': action_rows,
+                'recall_rows': recall_rows,
             }
 
         return collate
@@ -142,7 +125,24 @@ class Mem2WDualTrainer(Seq2SeqTrainer):
         return data_collator
 
     def _prepare_inputs(self, inputs):
-        return _prepare_nested(inputs, self.args.device)
+        # Collate only the active branch.  The dataset keeps raw rows so a
+        # 200k-token inactive recall/action stream is not encoded or moved to
+        # the GPU during the other stage.
+        step = int(self.state.global_step) + 1
+        total_steps = int(self.state.max_steps or self.args.max_steps)
+        stage = stage_for_step(step, total_steps, self.args.mem2w_warmup_fraction,
+                               parse_stage_plan(self.args.mem2w_stage_plan))
+        active_key = 'action_rows' if stage == 'W' else 'recall_rows'
+        prepared = {'action': [], 'recall': []}
+        rows = inputs.get(active_key, [])
+        branch = 'action' if stage == 'W' else 'recall'
+        prepared[branch] = [self.template.data_collator([dict(row)]) for row in rows]
+        prepared = _prepare_nested(prepared, self.args.device)
+        if self.template.sequence_parallel_size > 1:
+            from swift.sequence_parallel import sequence_parallel
+            for batch in prepared[branch]:
+                sequence_parallel.prepare_inputs(batch)
+        return prepared
 
     @staticmethod
     def _base_model(model):
@@ -155,12 +155,15 @@ class Mem2WDualTrainer(Seq2SeqTrainer):
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         return int(value.item())
 
-    @staticmethod
-    def _valid_count(batch) -> int:
+    def _valid_count(self, batch) -> int:
         labels = batch.get('labels')
-        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < 2:
+        shifted = self.template.sequence_parallel_size > 1
+        minimum_length = 1 if shifted else 2
+        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < minimum_length:
             raise ValueError('Mem2W paired batches must contain labels with shape [B,L]')
-        count = int(labels[:, 1:].ne(-100).sum().item())
+        # Native SP preparation rolls labels and then shards them, so count the
+        # already-shifted local frame rather than slicing it a second time.
+        count = int((labels if shifted else labels[:, 1:]).ne(-100).sum().item())
         if count <= 0:
             raise ValueError('Mem2W paired branch has zero supervised tokens')
         return count
@@ -176,13 +179,21 @@ class Mem2WDualTrainer(Seq2SeqTrainer):
             # performs an explicit four-parameter all-reduce afterwards.
             outputs = base.model(**_model_batch(batch), use_cache=False)
             loss, _ = chunked_hidden_cross_entropy(
-                outputs[0], base.get_output_embeddings(), batch['labels'], self.args.mem2w_loss_chunk_size)
+                outputs[0], base.get_output_embeddings(), batch['labels'], self.args.mem2w_loss_chunk_size,
+                labels_are_shifted=self.template.sequence_parallel_size > 1)
             self._mem2w_manual_grad_sync = True
             return loss, count
 
         outputs = model(**_model_batch(batch), use_cache=False)
         logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
-        loss, _ = masked_causal_cross_entropy(logits, batch['labels'])
+        loss, _ = masked_causal_cross_entropy(
+            logits, batch['labels'], labels_are_shifted=self.template.sequence_parallel_size > 1)
+        if stop_content_grad:
+            # Keep detached content parameters visible to DDP's reducer with a
+            # zero edge; training_step clears the resulting zero grads before
+            # AdamW so stale momentum/decay cannot update V/W_O.
+            memory = get_memory_module(base)
+            loss = loss + (memory.V.sum() + memory.W_O.sum()) * 0.0
         return loss, count
 
     def _iter_loss_terms(self, model, inputs):
@@ -271,17 +282,40 @@ class Mem2WDualTrainer(Seq2SeqTrainer):
             parameter.grad.div_(world_size)
 
     def training_step(self, model, inputs, *args, **kwargs):
+        # Keep ms-swift's model-specific forward context (Qwen3.5 FLA,
+        # FlashAttention and autocast hooks) around every branch forward.
+        with self.template.forward_context(self.model, inputs):
+            return self._training_step_impl(model, inputs, *args, **kwargs)
+
+    def _training_step_impl(self, model, inputs, *args, **kwargs):
         model.train()
         inputs = self._prepare_inputs(inputs)
+        step = int(self.state.global_step) + 1
+        total_steps = int(self.state.max_steps or self.args.max_steps)
+        stage = stage_for_step(step, total_steps, self.args.mem2w_warmup_fraction,
+                               parse_stage_plan(self.args.mem2w_stage_plan))
+        term_count = len(inputs['action'] if stage == 'W' else inputs['recall'])
         context = (torch.autograd.graph.save_on_cpu(pin_memory=False)
                    if self.args.mem2w_activation_offload else nullcontext())
         with context:
             total = None
             with self.compute_loss_context_manager():
-                for term in self._iter_loss_terms(model, inputs):
-                    self.accelerator.backward(term)
+                for index, term in enumerate(self._iter_loss_terms(model, inputs)):
+                    # DDP must synchronize only once per logical update.  The
+                    # final backward performs the reducer all-reduce; earlier
+                    # branch graphs use no_sync and are released immediately.
+                    sync_context = nullcontext()
+                    if (not self.args.mem2w_loss_chunk_size and index < term_count - 1
+                            and hasattr(model, 'no_sync')):
+                        sync_context = model.no_sync()
+                    with sync_context:
+                        self.accelerator.backward(term)
                     value = term.detach()
                     total = value if total is None else total + value
+        if stage == 'C':
+            memory = get_memory_module(self._base_model(model))
+            for name in ('V', 'W_O'):
+                getattr(memory, name).grad = None
         self._sync_manual_memory_grads()
         if total is None:
             raise ValueError('Mem2W paired data produced no branch losses')

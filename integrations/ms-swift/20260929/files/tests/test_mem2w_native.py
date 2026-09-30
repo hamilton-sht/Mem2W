@@ -4,7 +4,8 @@ torch = pytest.importorskip('torch')
 from torch import nn
 
 from swift.mem2w import Mem2WConfig, attach_memory, freeze_memory_only, get_memory_module
-from swift.mem2w.dual_trainer import Mem2WDualObjectiveTrainer
+from swift.mem2w.dual_trainer import (Mem2WDualObjectiveTrainer, parse_stage_plan,
+                                      stage_and_local_update, stage_for_step)
 from swift.tuner_plugin.mapping import tuners_map
 
 
@@ -33,6 +34,7 @@ def test_mem2w_is_a_native_tuner_and_preserves_layer_shape():
     freeze_memory_only(model)
     trainable = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     assert len(trainable) == 4
+    assert {parameter.dtype for parameter in get_memory_module(model).parameters()} == {torch.float32}
     hidden = torch.randn(2, 5, 8)
     layer = model.model.layers[15]
     layer._mem2w_enabled = False
@@ -53,3 +55,10 @@ def test_c_stage_clears_content_gradients_before_adamw():
     assert module.K.grad is not None
     assert module.V.grad is None
     assert module.W_O.grad is None
+
+
+def test_shared_stage_plan_has_consistent_global_and_local_cursors():
+    plan = parse_stage_plan('W:2,C:3,W:2')
+    assert stage_for_step(3, 7, 0.2, plan) == 'C'
+    assert stage_and_local_update(3, 7, 0.2, plan) == ('C', 1)
+    assert stage_and_local_update(6, 7, 0.2, plan) == ('W', 1)

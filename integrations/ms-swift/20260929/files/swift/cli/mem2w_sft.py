@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ import torch.distributed as dist
 
 from swift.arguments import SftArguments
 from swift.mem2w import get_memory_module
-from swift.mem2w.dual_trainer import Mem2WDualConfig, Mem2WDualObjectiveTrainer, read_jsonl
+from swift.mem2w.dual_trainer import Mem2WDualConfig, Mem2WDualObjectiveTrainer, parse_stage_plan, read_jsonl
 from swift.tuners.mem2w import Mem2WTuner
 
 
@@ -43,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--warmup-fraction', type=float, default=0.20)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--accumulation-steps', type=int, default=8)
+    parser.add_argument('--save-total-limit', type=int, default=8,
+                        help='number of step checkpoints to retain; stage-boundary checkpoints are always kept (0 disables pruning)')
     parser.add_argument('--lr-warmup-fraction', type=float, default=0.03)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--mem2w-insertion-index', type=int, default=15)
@@ -56,26 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--distributed-backend', default='nccl')
     parser.add_argument('--sequence-parallel-size', type=int, default=1)
     return parser
-
-
-def _parse_stage_plan(value: str | None) -> tuple[tuple[str, int], ...] | None:
-    if value is None:
-        return None
-    plan = []
-    for item in value.split(','):
-        stage, separator, count = item.strip().partition(':')
-        if not separator or stage not in {'W', 'C'}:
-            raise ValueError('--stage-plan entries must use W:<updates> or C:<updates>')
-        try:
-            updates = int(count)
-        except ValueError as exc:
-            raise ValueError(f'invalid stage-plan update count: {count!r}') from exc
-        if updates <= 0:
-            raise ValueError('--stage-plan update counts must be positive')
-        plan.append((stage, updates))
-    if not plan:
-        raise ValueError('--stage-plan must not be empty')
-    return tuple(plan)
 
 
 def _make_args(ns: argparse.Namespace) -> SftArguments:
@@ -141,6 +124,28 @@ def _shard_rows(rows: list[dict], rank: int, world_size: int) -> list[dict]:
     return shard or rows[:1]
 
 
+def _prune_checkpoints(output_dir: Path, limit: int, protected: set[int]) -> None:
+    """Bound checkpoint storage without deleting W/C stage boundaries."""
+    if limit <= 0:
+        return
+    checkpoints = []
+    for path in output_dir.glob('checkpoint-*'):
+        if not path.is_dir():
+            continue
+        try:
+            checkpoints.append((int(path.name.split('-', 1)[1]), path))
+        except (IndexError, ValueError):
+            continue
+    if len(checkpoints) <= limit:
+        return
+    checkpoints.sort()
+    keep = {step for step, _path in checkpoints[-limit:]}
+    keep.update(protected)
+    for step, path in checkpoints:
+        if step not in keep:
+            shutil.rmtree(path)
+
+
 def run(ns: argparse.Namespace) -> dict:
     rank, world_size, _local_rank = _distributed_setup(ns.distributed_backend)
     is_main = rank == 0
@@ -148,7 +153,7 @@ def run(ns: argparse.Namespace) -> dict:
         print(json.dumps({'event': 'runtime_devices', 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
                           'cuda_available': torch.cuda.is_available(),
                           'cuda_device_count': torch.cuda.device_count()}), flush=True)
-    stage_plan = _parse_stage_plan(ns.stage_plan)
+    stage_plan = parse_stage_plan(ns.stage_plan)
     if stage_plan is None and ns.max_steps < 1:
         raise ValueError('--max-steps must be positive')
     total_updates = sum(updates for _stage, updates in stage_plan) if stage_plan else ns.max_steps
@@ -298,6 +303,12 @@ def run(ns: argparse.Namespace) -> dict:
                 + '\n', encoding='utf-8')
             with (output_dir / 'training_metrics.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps({'global_step': update_index, **metrics}, ensure_ascii=False) + '\n')
+            boundaries = set()
+            consumed = 0
+            for _stage, count in stage_plan or ():
+                consumed += int(count)
+                boundaries.add(consumed)
+            _prune_checkpoints(output_dir, ns.save_total_limit, boundaries)
         if world_size > 1:
             dist.barrier()
     summary = {
