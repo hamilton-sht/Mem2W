@@ -16,11 +16,11 @@
 
 | 入口 | 实际调用 | W/C 语义 | 生命周期 |
 | --- | --- | --- | --- |
-| `swift/cli/mem2w_sft.py`（此前 CWW 任务命令） | `Mem2WDualObjectiveTrainer` | 每个 step 都计算 action + recall；C 只在 recall 分支 detach V/W_O | 自建 optimizer、scheduler、循环、手动 all-reduce、每步保存 |
+| `swift/cli/mem2w_sft.py`（CWW 任务命令） | `Mem2WDualObjectiveTrainer` | 显式 stage plan 下 W 只计算 action、C 只计算 recall；每个阶段重置数据游标 | 自建 optimizer、scheduler、循环、手动 all-reduce、每步保存 |
 | `swift sft --tuner_type mem2w` | `Mem2WDualTrainer(Seq2SeqTrainer)` | W 只计算 action；C 只计算 recall 并 detach V/W_O | ms-swift/Transformers Trainer，覆盖 paired training_step |
 | `swift sft --tuner_type lora --sft_loss_chunk_size 256` | 修改过的 `Seq2SeqTrainer` | 每次调用只用一份 dataset；外层脚本串联 C/W/W | 原生 Trainer 生命周期，但 loss 和梯度同步有自定义修改 |
 
-**更正此前汇报**：把文件放入 ms-swift 仓库不等于当前任务已经使用原生 Trainer。旧 CWW 命令仍走第一条自定义循环，不能称为“C-only → W-only → W-only”。普通 LoRA 也不是完全未修改的上游 loss 路径。
+**运行注意**：修复后的源码已同时更新到 `ms-swift-mem2w` 和本目录快照；已经启动的旧进程不会热加载新代码。旧进程若在修复前启动，仍应按历史混合 action+recall 结果处理，不能当作严格的 C-only → W-only → W-only 实验。普通 LoRA 也不是完全未修改的上游 loss 路径。
 
 对应代码：
 
@@ -86,7 +86,7 @@
 ## 4. 实现审查时需要重点关注的地方（尚未修复）
 
 1. **“第16层全调”的含义**：`freeze_memory_only()` 冻结整个 Qwen 主干，包括原第16层；只训练插入其后的 4 个 memory 参数，绝不是原 decoder block 第16层所有权重全调。
-2. **两种阶段语义不一致**：自定义循环仍两路训练，原生 Trainer 按阶段只走一路。两个入口不能混用同一“1 epoch C/W”的表述。
+2. **两种入口仍需区分**：修复后的自定义循环和原生 Trainer 都按显式 stage plan 只走一路；但是已运行的旧进程使用的是修复前代码，不能与新 smoke 或新实验混合统计。
 3. **C-only 从零初始化开始的风险**：`W_O` 初始化为 0，而 C recall 将 V/W_O detach；如果没有先学到非零 W_O 或加载非零 checkpoint，recall 对 W_Q/K 的梯度可能为零。这需要专门测试；此前“首个 C step 只有 W_O 更新符合 C 设计”的说明不成立，那次更新可能来自 action 分支。
 4. **SP token 归一化/日志**：自定义循环在 prepare_inputs 之前统计完整样本 labels，然后对各 rank 做 SUM；SP rank 共享完整样本，这会重复计数。随后 local mean loss 和梯度同步的权重也需要核对，日志 token 数不能直接当作独立监督 token 数或用于计算绝对吞吐。
 5. **原生 Mem2W Trainer 的 SP 覆盖**：其自定义 `_prepare_inputs` / `_forward_branch` 未像独立循环显式调用 SP prepare_inputs，且 `_valid_count` 与 chunked CE 默认 shift 路径不同于 LoRA SP 路径；不能把 LoRA SP 成功直接等同于该 Trainer 的 SP 验证通过。
