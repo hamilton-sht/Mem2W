@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two-GPU Mem2W staged experiment: C(recall) -> W(action) -> W(action).
+# Two-GPU Mem2W staged experiment: W(action) -> C(recall) -> W(action).
 #
 # This is the native ms-swift Mem2W entry point.  The two visible ranks are
 # sequence-parallel workers, so each dataset row is consumed once per logical
@@ -14,7 +14,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/afs/models/Qwen3.5-4B}"
 DATA_DIR="${DATA_DIR:-/home/sht/haoting/data/automationbench_0916_native}"
 GPU_IDS="${GPU_IDS:-4,5}"
 SEQUENCE_PARALLEL_SIZE="${SEQUENCE_PARALLEL_SIZE:-2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/sht/haoting/runs/mem2w_cww_2gpu_4b_sp2_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/sht/haoting/runs/mem2w_wcw_2gpu_4b_sp2_$(date +%Y%m%d_%H%M%S)}"
 MAX_LENGTH="${MAX_LENGTH:-262144}"
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-8}"
 LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-256}"
@@ -65,12 +65,12 @@ accum = int(sys.argv[2])
 print(math.ceil(report['counts']['action'] / accum), math.ceil(report['counts']['recall'] / accum))
 PY
 )
-TOTAL_UPDATES=$((RECALL_UPDATES + ACTION_UPDATES + ACTION_UPDATES))
-STAGE_PLAN="C:${RECALL_UPDATES},W:${ACTION_UPDATES},W:${ACTION_UPDATES}"
+TOTAL_UPDATES=$((ACTION_UPDATES + RECALL_UPDATES + ACTION_UPDATES))
+STAGE_PLAN="W:${ACTION_UPDATES},C:${RECALL_UPDATES},W:${ACTION_UPDATES}"
 
 cat > "$OUTPUT_DIR/experiment_plan.json" <<EOF
 {
-  "experiment": "mem2w_staged_C1_W1_W1",
+  "experiment": "mem2w_staged_W1_C1_W1",
   "gpu_ids": "${GPU_IDS}",
   "world_size": ${WORLD_SIZE},
   "sequence_parallel_size": ${SEQUENCE_PARALLEL_SIZE},
@@ -119,7 +119,7 @@ fi
 printf 'planned command:'
 printf ' %q' "${CMD[@]}"
 printf '\n'
-echo "CWW plan: C=${RECALL_UPDATES}, W=${ACTION_UPDATES}, W=${ACTION_UPDATES}; total=${TOTAL_UPDATES}"
+echo "WCW plan: W=${ACTION_UPDATES}, C=${RECALL_UPDATES}, W=${ACTION_UPDATES}; total=${TOTAL_UPDATES}"
 echo "model=${MODEL_PATH} cards=${GPU_IDS} sequence_parallel=${SEQUENCE_PARALLEL_SIZE} output=${OUTPUT_DIR}"
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -136,10 +136,10 @@ export MEM2W_DISABLE_TORCH_COMPILE="${MEM2W_DISABLE_TORCH_COMPILE:-1}"
 CUDA_VISIBLE_DEVICES="$GPU_IDS" \
   "${CMD[@]}" 2>&1 | tee "$OUTPUT_DIR/training.log"
 
-for boundary in "$RECALL_UPDATES" "$((RECALL_UPDATES + ACTION_UPDATES))" "$TOTAL_UPDATES"; do
+for boundary in "$ACTION_UPDATES" "$((ACTION_UPDATES + RECALL_UPDATES))" "$TOTAL_UPDATES"; do
   [[ -f "$OUTPUT_DIR/checkpoint-${boundary}/memory.safetensors" ]] || {
     echo "ERROR: missing boundary checkpoint checkpoint-${boundary}" >&2
     exit 3
   }
 done
-echo "Mem2W CWW experiment completed: $OUTPUT_DIR"
+echo "Mem2W WCW experiment completed: $OUTPUT_DIR"

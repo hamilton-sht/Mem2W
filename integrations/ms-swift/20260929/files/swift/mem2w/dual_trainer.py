@@ -393,6 +393,17 @@ class Mem2WDualObjectiveTrainer:
         gradients = [parameter for parameter in parameters if parameter.grad is not None]
         if not gradients:
             raise RuntimeError('no Mem2W parameter received a gradient')
+        # W_O is intentionally zero-initialized.  A recall-only C update that
+        # starts before any W update therefore has an exactly zero residual
+        # when V/W_O are detached, and silently trains nothing.  Fail loudly
+        # instead of spending hours on a no-op long-context step; the staged
+        # runner orders the phases W -> C -> W so a valid C update has a
+        # non-zero read-path gradient.
+        if stage == 'C' and not any(bool(parameter.grad.detach().float().abs().sum().item())
+                                    for parameter in parameters if parameter.grad is not None):
+            raise RuntimeError(
+                'C stage produced zero Mem2W gradients; run a W stage first '
+                'to initialize the zero-initialized W_O readout')
         total_norm = torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm)
         if not bool(torch.isfinite(total_norm).item()):
             raise FloatingPointError('non-finite Mem2W gradient norm')

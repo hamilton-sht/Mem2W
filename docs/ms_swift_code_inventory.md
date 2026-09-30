@@ -87,7 +87,7 @@
 
 1. **“第16层全调”的含义**：`freeze_memory_only()` 冻结整个 Qwen 主干，包括原第16层；只训练插入其后的 4 个 memory 参数，绝不是原 decoder block 第16层所有权重全调。
 2. **两种入口仍需区分**：修复后的自定义循环和原生 Trainer 都按显式 stage plan 只走一路；但是已运行的旧进程使用的是修复前代码，不能与新 smoke 或新实验混合统计。
-3. **C-only 从零初始化开始的风险**：`W_O` 初始化为 0，而 C recall 将 V/W_O detach；如果没有先学到非零 W_O 或加载非零 checkpoint，recall 对 W_Q/K 的梯度可能为零。这需要专门测试；此前“首个 C step 只有 W_O 更新符合 C 设计”的说明不成立，那次更新可能来自 action 分支。
+3. **C-only 从零初始化禁止**：`W_O` 初始化为 0，而 C recall 将 V/W_O detach；如果没有先学到非零 W_O 或加载非零 checkpoint，recall 对 W_Q/K 的梯度必然为零。正式阶段顺序固定为 W→C→W，且 trainer 对 C 阶段零 Mem2W 梯度直接报错；因此不能把 CWW 当作从零开始的有效 Mem2W 计划。
 4. **SP token 归一化/日志**：自定义循环在 prepare_inputs 之前统计完整样本 labels，然后对各 rank 做 SUM；SP rank 共享完整样本，这会重复计数。随后 local mean loss 和梯度同步的权重也需要核对，日志 token 数不能直接当作独立监督 token 数或用于计算绝对吞吐。
 5. **原生 Mem2W Trainer 的 SP 覆盖**：其自定义 `_prepare_inputs` / `_forward_branch` 未像独立循环显式调用 SP prepare_inputs，且 `_valid_count` 与 chunked CE 默认 shift 路径不同于 LoRA SP 路径；不能把 LoRA SP 成功直接等同于该 Trainer 的 SP 验证通过。
 6. **通用 chunked SFT 路径**：`_chunked_sft_loss` 丢弃 `loss_scale`，通过 base.model 绕过 DDP wrapper 并手动同步梯度。需要审核 token 权重语义、每个 microbatch 的同步开销、zero-local-labels 情况；并非完全原封不动的原生 loss。
