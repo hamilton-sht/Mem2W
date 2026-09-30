@@ -876,7 +876,7 @@ diff --git a/swift/mem2w/dual_trainer.py b/swift/mem2w/dual_trainer.py
 new file mode 100644
 --- /dev/null
 +++ b/swift/mem2w/dual_trainer.py
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,432 @@
 +"""Paired action/recall Mem2W training on top of ms-swift templates.
 +
 +This module intentionally stays below the public ``swift sft`` path.  The
@@ -885,7 +885,7 @@ new file mode 100644
 +
 +* encode action and recall rows with the native ms-swift template;
 +* normalize each branch by its own supervised-token count;
-+* run both forwards before one optimizer step;
++* run the active stage's forwards before one optimizer step;
 +* in stage C, detach only the recall content path (V/W_O), while retaining
 +  the recall query/key path (W_Q/K).
 +
@@ -972,7 +972,10 @@ new file mode 100644
 +    valid = shifted_labels.ne(-100)
 +    count = int(valid.sum().item())
 +    if not count:
-+        raise ValueError('branch has zero supervised tokens')
++        # Sequence parallelism can place all assistant labels on the other
++        # rank.  Keep a graph-connected zero so Trainer.backward remains
++        # collective-safe; the global token count is reduced by the caller.
++        return hidden.float().sum() * 0.0, 0
 +    selected = selected_hidden[valid]
 +    targets = shifted_labels[valid]
 +
@@ -1045,7 +1048,7 @@ new file mode 100644
 +    valid = shifted_labels.ne(ignore_index)
 +    token_count = int(valid.sum().item())
 +    if token_count == 0:
-+        raise ValueError('branch has zero supervised tokens')
++        return logits.float().sum() * 0.0, 0
 +    loss = F.cross_entropy(
 +        shifted_logits.view(-1, shifted_logits.shape[-1]),
 +        shifted_labels.view(-1),
@@ -1121,6 +1124,25 @@ new file mode 100644
 +        # would let the later branch overwrite the earlier one's lengths.
 +        return batch
 +
++    def _stage_and_local_update(self, update_index: int) -> tuple[str, int]:
++        """Return the active objective and its one-based update within that stage.
++
++        Explicit C/W plans represent separate dataset epochs.  Resetting the
++        row cursor at each boundary is therefore required; using the global
++        update index would skip the first rows of every later stage.
++        """
++        plan = self.config.stage_plan
++        if plan is None:
++            return objective_stage(update_index, self.total_updates,
++                                   self.config.warmup_fraction, None), update_index
++        consumed = 0
++        for stage, updates in plan:
++            updates = int(updates)
++            if update_index <= consumed + updates:
++                return stage, update_index - consumed
++            consumed += updates
++        raise ValueError(f'update_index {update_index} exceeds explicit stage plan of {consumed} updates')
++
 +    def _valid_token_count(self, batch: Mapping[str, Any]) -> int:
 +        labels = batch.get('labels')
 +        if not isinstance(labels, torch.Tensor) or labels.ndim != 2 or labels.shape[1] < 2:
@@ -1136,6 +1158,14 @@ new file mode 100644
 +        value = torch.tensor([count], dtype=torch.long, device=self.device)
 +        dist.all_reduce(value, op=dist.ReduceOp.SUM)
 +        return int(value.item())
++
++    def _global_loss_sum(self, value: float) -> float:
++        """Aggregate branch loss numerators for rank-independent metrics."""
++        if not dist.is_available() or not dist.is_initialized():
++            return float(value)
++        tensor = torch.tensor([value], dtype=torch.float64, device=self.device)
++        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
++        return float(tensor.item())
 +
 +    def _forward_loss(self, batch: Mapping[str, Any], *, stop_content_grad: bool) -> tuple[torch.Tensor, int]:
 +        set_stop_content_grad(self.model, stop_content_grad)
@@ -1196,22 +1226,25 @@ new file mode 100644
 +        started = time.monotonic()
 +        if self.device.type == 'cuda':
 +            torch.cuda.reset_peak_memory_stats(self.device)
-+        stage = objective_stage(update_index, self.total_updates, self.config.warmup_fraction,
-+                                self.config.stage_plan)
++        stage, stage_update = self._stage_and_local_update(update_index)
 +        self.model.train()
 +        self.optimizer.zero_grad(set_to_none=True)
 +
-+        base_index = (update_index - 1) * self.accumulation_steps
-+        action_batches = [self._batch(self.action_encoded, base_index + offset)
-+                          for offset in range(self.accumulation_steps)]
-+        recall_batches = [self._batch(self.recall_encoded, base_index + offset)
-+                          for offset in range(self.accumulation_steps)]
-+        action_counts = [self._valid_token_count(batch) for batch in action_batches]
-+        recall_counts = [self._valid_token_count(batch) for batch in recall_batches]
-+        action_tokens = self._global_count(sum(action_counts))
-+        recall_tokens = self._global_count(sum(recall_counts))
-+        if action_tokens == 0 or recall_tokens == 0:
-+            raise ValueError('paired dataset has zero supervised tokens across sequence-parallel ranks')
++        base_index = (stage_update - 1) * self.accumulation_steps
++        if stage == 'W':
++            action_batches = [self._batch(self.action_encoded, base_index + offset)
++                              for offset in range(self.accumulation_steps)]
++            action_counts = [self._valid_token_count(batch) for batch in action_batches]
++            action_tokens = self._global_count(sum(action_counts))
++            recall_batches, recall_counts, recall_tokens = [], [], 0
++        else:
++            recall_batches = [self._batch(self.recall_encoded, base_index + offset)
++                              for offset in range(self.accumulation_steps)]
++            recall_counts = [self._valid_token_count(batch) for batch in recall_batches]
++            recall_tokens = self._global_count(sum(recall_counts))
++            action_batches, action_counts, action_tokens = [], [], 0
++        if (stage == 'W' and action_tokens == 0) or (stage == 'C' and recall_tokens == 0):
++            raise ValueError(f'{stage} stage has zero supervised tokens across sequence-parallel ranks')
 +        action_loss_sum = 0.0
 +        for batch, count in zip(action_batches, action_counts):
 +            if self.config.sequence_parallel_size > 1:
@@ -1231,6 +1264,9 @@ new file mode 100644
 +                weight=self.config.lambda_recall * count / recall_tokens)
 +            recall_loss_sum += recall_loss * count
 +
++        action_loss_sum = self._global_loss_sum(action_loss_sum)
++        recall_loss_sum = self._global_loss_sum(recall_loss_sum)
++
 +        parameters = memory_parameters(self.model)
 +        self._synchronize_gradients(parameters)
 +        gradients = [parameter for parameter in parameters if parameter.grad is not None]
@@ -1249,8 +1285,8 @@ new file mode 100644
 +            self.scheduler.step()
 +        return {
 +            'stage': stage,
-+            'loss_action': action_loss_sum / action_tokens,
-+            'loss_recall': recall_loss_sum / recall_tokens,
++            'loss_action': action_loss_sum / action_tokens if action_tokens else 0.0,
++            'loss_recall': recall_loss_sum / recall_tokens if recall_tokens else 0.0,
 +            'tokens_action': action_tokens,
 +            'tokens_recall': recall_tokens,
 +            'memory_grad_norm': float(total_norm.detach().cpu()),

@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-09-29T15:42:31.455768+00:00",
+  "captured_at_utc": "2026-09-30T02:35:27.061320+00:00",
   "upstream": "https://github.com/modelscope/ms-swift",
   "base_commit": "c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c",
   "source": "A800 /home/sht/haoting/ms-swift-mem2w (disk snapshot; not a Git repository)",
@@ -99,8 +99,8 @@
     {
       "path": "swift/mem2w/dual_trainer.py",
       "status": "A",
-      "bytes": 19438,
-      "sha256": "ba2f0157f8776dbfe2d914e73a4956676a2c08e8209bddf80a7dc4b9c2a8e3db",
+      "bytes": 21342,
+      "sha256": "4f798ad3d9aae05331ac293aa9942d149d4f8c591152d0e6e9f600465cc3a069",
       "upstream_sha256": null
     },
     {

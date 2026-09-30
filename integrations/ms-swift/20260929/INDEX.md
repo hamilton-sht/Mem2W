@@ -31,7 +31,7 @@ Base: `c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c`
 
 | A | [swift/mem2w/config.py](files/swift/mem2w/config.py) | 63 |
 
-| A | [swift/mem2w/dual_trainer.py](files/swift/mem2w/dual_trainer.py) | 396 |
+| A | [swift/mem2w/dual_trainer.py](files/swift/mem2w/dual_trainer.py) | 432 |
 
 | A | [swift/mem2w/integration.py](files/swift/mem2w/integration.py) | 200 |
 
