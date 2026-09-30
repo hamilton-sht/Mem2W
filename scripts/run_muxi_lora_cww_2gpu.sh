@@ -7,6 +7,7 @@ set -Eeuo pipefail
 SWIFT_ROOT="${SWIFT_ROOT:-/home/sht/haoting/ms-swift-mem2w}"
 MODEL_PATH="${MODEL_PATH:-/mnt/afs/models/Qwen3.5-4B}"
 DATA_DIR="${DATA_DIR:-/home/sht/haoting/data/automationbench_0916_native}"
+DATA_VIEW_DIR="${DATA_VIEW_DIR:-${DATA_DIR}_ms_swift}"
 GPU_IDS="${GPU_IDS:-2,3}"
 SEQUENCE_PARALLEL_SIZE="${SEQUENCE_PARALLEL_SIZE:-2}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/sht/haoting/runs/lora_CWW_2gpu_4b_$(date +%Y%m%d_%H%M%S)}"
@@ -21,6 +22,24 @@ MEM2W_DISABLE_TORCH_COMPILE="${MEM2W_DISABLE_TORCH_COMPILE:-1}"
 
 ACTION_DATASET="${ACTION_DATASET:-${DATA_DIR}/action_train.jsonl}"
 RECALL_DATASET="${RECALL_DATASET:-${DATA_DIR}/recall_train.jsonl}"
+NORMALIZE_SCRIPT="${NORMALIZE_SCRIPT:-/home/sht/haoting/Mem2W/scripts/normalize_ms_swift_tool_calls.py}"
+PREPARE_SCRIPT="${PREPARE_SCRIPT:-/home/sht/haoting/Mem2W/scripts/prepare_ms_swift_sft_jsonl.py}"
+
+# Keep the rich AutomationBench source untouched.  Native ms-swift loads JSONL
+# through HF Arrow, so heterogeneous nullable tool-call fields must be
+# normalized and metadata must be removed before every LoRA stage.  This also
+# makes W1/W2 use exactly the same schema as C.
+if [[ -f "$NORMALIZE_SCRIPT" && -f "$PREPARE_SCRIPT" ]]; then
+  mkdir -p "$DATA_VIEW_DIR/_normalized"
+  python3 "$NORMALIZE_SCRIPT" --src-dir "$DATA_DIR" --dst-dir "$DATA_VIEW_DIR/_normalized" \
+    > "$DATA_VIEW_DIR/normalization.log"
+  python3 "$PREPARE_SCRIPT" --src "$DATA_VIEW_DIR/_normalized/recall_train.jsonl" \
+    --dst "$DATA_VIEW_DIR/recall_train.jsonl" > "$DATA_VIEW_DIR/recall_prepare.log"
+  python3 "$PREPARE_SCRIPT" --src "$DATA_VIEW_DIR/_normalized/action_train.jsonl" \
+    --dst "$DATA_VIEW_DIR/action_train.jsonl" > "$DATA_VIEW_DIR/action_prepare.log"
+  ACTION_DATASET="$DATA_VIEW_DIR/action_train.jsonl"
+  RECALL_DATASET="$DATA_VIEW_DIR/recall_train.jsonl"
+fi
 
 for required_path in "$SWIFT_ROOT/swift/cli/sft.py" "$MODEL_PATH" "$ACTION_DATASET" "$RECALL_DATASET"; do
   [[ -e "$required_path" ]] || { echo "ERROR: missing required path: $required_path" >&2; exit 2; }
