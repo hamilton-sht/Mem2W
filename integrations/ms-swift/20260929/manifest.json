@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-09-30T06:28:10.901121+00:00",
+  "captured_at_utc": "2026-09-30T06:30:09.291569+00:00",
   "upstream": "https://github.com/modelscope/ms-swift",
   "base_commit": "c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c",
   "source": "A800 /home/sht/haoting/ms-swift-mem2w (disk snapshot; not a Git repository)",
@@ -78,8 +78,8 @@
     {
       "path": "swift/cli/mem2w_sft.py",
       "status": "A",
-      "bytes": 16138,
-      "sha256": "0821c96677642c984b700b464ff368555e5ceeaadce29fe9e6c9483854a3d52d",
+      "bytes": 16456,
+      "sha256": "68aee16baac3a79fbcbb6c47aedd1948d3b01a46783d7e869b8fa6f1bad63646",
       "upstream_sha256": null
     },
     {

@@ -461,7 +461,7 @@ diff --git a/swift/cli/mem2w_sft.py b/swift/cli/mem2w_sft.py
 new file mode 100644
 --- /dev/null
 +++ b/swift/cli/mem2w_sft.py
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,333 @@
 +"""Native ms-swift paired Mem2W action/recall training entry point."""
 +
 +from __future__ import annotations
@@ -699,6 +699,11 @@ new file mode 100644
 +        state_path = checkpoint / 'mem2w_dual_state.json'
 +        if optimizer_path.is_file():
 +            optimizer.load_state_dict(torch.load(optimizer_path, map_location='cpu', weights_only=True))
++            # Checkpoints written before the C-stage optimizer fix may carry
++            # AdamW's default weight_decay=0.01.  Keep the experiment's
++            # declared Mem2W optimizer contract when resuming those states.
++            for group in optimizer.param_groups:
++                group['weight_decay'] = 0.0
 +        scheduler_path = checkpoint / 'scheduler.pt'
 +        if scheduler_path.is_file():
 +            scheduler.load_state_dict(torch.load(scheduler_path, map_location='cpu', weights_only=True))

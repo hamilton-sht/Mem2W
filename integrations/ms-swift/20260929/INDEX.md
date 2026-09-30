@@ -25,7 +25,7 @@ Base: `c08110b30a1ccb60bcfb70adf87d2cd72f5b9f3c`
 
 | M | [swift/cli/main.py](files/swift/cli/main.py) | 107 |
 
-| A | [swift/cli/mem2w_sft.py](files/swift/cli/mem2w_sft.py) | 328 |
+| A | [swift/cli/mem2w_sft.py](files/swift/cli/mem2w_sft.py) | 333 |
 
 | A | [swift/mem2w/__init__.py](files/swift/mem2w/__init__.py) | 10 |
 

@@ -235,6 +235,11 @@ def run(ns: argparse.Namespace) -> dict:
         state_path = checkpoint / 'mem2w_dual_state.json'
         if optimizer_path.is_file():
             optimizer.load_state_dict(torch.load(optimizer_path, map_location='cpu', weights_only=True))
+            # Checkpoints written before the C-stage optimizer fix may carry
+            # AdamW's default weight_decay=0.01.  Keep the experiment's
+            # declared Mem2W optimizer contract when resuming those states.
+            for group in optimizer.param_groups:
+                group['weight_decay'] = 0.0
         scheduler_path = checkpoint / 'scheduler.pt'
         if scheduler_path.is_file():
             scheduler.load_state_dict(torch.load(scheduler_path, map_location='cpu', weights_only=True))
